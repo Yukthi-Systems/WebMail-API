@@ -1,0 +1,103 @@
+services:
+  webmail-main-api:
+    # The image is available on private docker hub, you can use your own image if you have built it
+    image: rjyspl/webmail-main-api:latest
+    container_name: webmail-main-api
+
+    # The environment variables are used to configure the application
+    # Use the correct values for the environment variables
+    environment:
+      - TZ=Asia/Kolkata
+
+      - GUNICORN_ARG_WORKERS=8
+      - GUNICORN_ARG_THREADS=8
+      - GUNICORN_ARG_TIMEOUT=180
+      - GUNICORN_ARG_BIND_PORT=8086
+      
+      - POSTGRES_DB_USERNAME=db_user
+      - POSTGRES_DB_PASSWORD=db_password
+      - POSTGRES_DB_HOST=postgres-database
+      - POSTGRES_DB_PORT=5432
+      - POSTGRES_DB_DATABASE=webmail
+      # Do like above or give POSTGRES_DB_URI for the connection string
+      # - POSTGRES_DB_URI=postgresql://db_user:db_password@postgres-database:5432/webmail
+      - POSTGRES_POOL_SIZE=10
+      - POSTGRES_POOL_MAX_INACTIVE_CONNECTION_LIFETIME=300
+      - ADMIN_POSTGRES_DB_USERNAME=v2_user
+      - ADMIN_POSTGRES_DB_PASSWORD=v2_password
+      - ADMIN_POSTGRES_DB_HOST=pgsql.example.com
+      - ADMIN_POSTGRES_DB_PORT=1432
+      - ADMIN_POSTGRES_DB_DATABASE=db_name
+      # Do like above or give ADMIN_POSTGRES_DB_URI for the connection string
+      # - ADMIN_POSTGRES_DB_URI=postgresql://v2_user:v2_password@pgsql.example.com:1432/db_name
+      - ADMIN_POSTGRES_POOL_SIZE=3
+
+      - MEMCACHED_DB_HOST=memcached-database
+      - MEMCACHED_DB_PORT=11211
+      - MEMCACHED_DB_POOL_SIZE=50
+      # Session expiry time in seconds (default is 3 x 60 x 60 = 10800 = 3 hours)
+      - MAX_AGE_OF_CACHE=28800
+
+      # RabbitMQ configuration
+      - RABBITMQ_HOST=0.0.0.0
+      - RABBITMQ_PORT=1234
+      - RABBITMQ_VIRTUAL_HOST=vhost
+      - RABBITMQ_USERNAME=rabbitmq-username
+      - RABBITMQ_PASSWORD=rabbitmq-password
+      - RABBITMQ_EXCHANGE=web_mail
+      - RABBITMQ_ROUTING_KEY=prod_send_emails
+
+      # reCAPTCHA configuration
+      - GOOGLE_RECAPTCHA_PROJECT_ID=google-recaptcha-project-id
+      - GOOGLE_RECAPTCHA_API_KEY=google-recaptcha-api-key
+      - GOOGLE_RECAPTCHA_SITE_KEY=google-recaptcha-site-key
+
+      - LOG_LEVEL=10
+      - LOGS_API_PASSWORD=logs-api-password
+      - NUMBER_OF_LOGS_TO_DISPLAY=200
+
+      - API_KEY=internal-api-key
+      - API_COOKIE_DOMAIN=.example.com
+      - LOCAL_SMTP_HOST_NAME=example.com
+      - SMTP_CONNECTION_TIMEOUT=10
+      - ALLOWED_ORIGINS=https://api.webmail.example.com,https://webmail-ui.example.com
+
+    # The ports are used to expose the application to the host machine
+    ports:
+      - "127.0.0.1:8086:8086" # Note: Make sure it matches with the GUNICORN_ARG_BIND_PORT
+
+    # The volumes are used to store the logs
+    # LHS is the host machine path and RHS is the container path
+    # Change the LHS to the correct path to store the logs (if required)
+    volumes:
+      - /var/log/webmail-main-api:/var/log/api
+
+    networks:
+      - webmail-network
+
+    # The restart policy is set to always to restart the container in case of failure
+    restart: always
+
+  postgres-database:
+    image: postgres:16
+    container_name: postgres-database
+    environment:
+      - POSTGRES_PASSWORD=db_password
+      - POSTGRES_USER=db_user
+      - POSTGRES_DB=webmail
+    volumes:
+      - /var/lib/postgresql/data:/var/lib/postgresql/data
+    restart: always
+    networks:
+      - webmail-network
+    
+  memcached-database:
+    image: memcached:1.6
+    container_name: memcached-database
+    restart: always
+    networks:
+      - webmail-network
+
+networks:
+  webmail-network:
+    driver: bridge
