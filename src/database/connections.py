@@ -13,6 +13,22 @@ It includes the following components:
     - A context manager `lifespan` that initializes and closes the database connections when the FastAPI application starts and stops.
 """
 
+# Copyright (C) 2026 Yukthi Systems Private Limited
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3
+# as published by the Free Software Foundation.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# version 3 along with this program. If not, see
+# <https://www.gnu.org/licenses/>.
+
+
 from src.utils.base.libraries import Depends, status, asyncpg, aiomcache, logging, asynccontextmanager, Annotated, AsyncGenerator, Optional, FastAPI
 from src.utils.base.constants import POSTGRES_DB_URI, POSTGRES_POOL_SIZE, MEMCACHED_DB_HOST, MEMCACHED_DB_PORT, MEMCACHED_DB_POOL_SIZE, ADMIN_POSTGRES_DB_URI, ADMIN_POSTGRES_POOL_SIZE, POSTGRES_POOL_MAX_INACTIVE_CONNECTION_LIFETIME
 from src.utils.models import All_Exceptions

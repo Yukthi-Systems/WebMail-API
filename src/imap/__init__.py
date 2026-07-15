@@ -2,6 +2,22 @@
 All the IMAP related functions and classes are defined in this module
 """
 
+# Copyright (C) 2026 Yukthi Systems Private Limited
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3
+# as published by the Free Software Foundation.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# version 3 along with this program. If not, see
+# <https://www.gnu.org/licenses/>.
+
+
 from .connections import get_imap_connection, get_imap_connection_from_user_data
 from .handlers import list_folders, parse_acl_response, parse_imap_response, get_email_details, get_raw_email, parse_quota_response, move_multiple_emails, copy_multiple_emails, mark_emails_as_read, mark_emails_as_unseen, mark_emails_as_flagged, mark_emails_as_unflagged, delete_emails_permanently, search_emails, get_email_details_by_message_id
 
