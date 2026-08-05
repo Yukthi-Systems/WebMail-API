@@ -212,6 +212,7 @@ def send_mail_rabbit(email_data: SendMailForm, user_data: dict, attachments: lis
                     "password": user_data["imap_password"] # TODO: Raw password, consider encrypting?
                 }
             },
+            "read_receipt": email_data.read_receipt,
             "draft_saved": email_data.draft_saved,
             "draft_folder_name": email_data.draft_folder_name,
             "draft_message_id": email_data.draft_message_id
@@ -271,6 +272,7 @@ def draft_mail_rabbit(email_data: SendMailForm, user_data: dict, attachments: li
                     "password": user_data["imap_password"] # TODO: Raw password, consider encrypting?
                 }
             },
+            "read_receipt": email_data.read_receipt,
             "draft_saved": email_data.draft_saved,
             "draft_folder_name": email_data.draft_folder_name,
             "draft_message_id": email_data.draft_message_id

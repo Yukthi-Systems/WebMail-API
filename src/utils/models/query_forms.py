@@ -131,6 +131,7 @@ class SendMailForm(BaseModel):
     priority: Optional[str] = Field('normal', title="Priority", description="Email priority: normal, high, or low")
     timestamp: Optional[str] = Field('', title="Timestamp", description="ISO 8601 timestamp of the email")
     draft_saved: bool = Field(False, title="Draft Saved", description="Flag to indicate if the email is saved as draft")
+    read_receipt: bool = Field(..., title="Read Receipt", description="Flag to request a read receipt for the email")
     draft_folder_name: Optional[str] = Field(None, title="Draft Folder Name", description="Name of the folder where the draft is saved")
     draft_message_id: Optional[str] = Field(None, title="Draft Message ID", description="ID of the draft message")
 
@@ -173,6 +174,7 @@ class SendMailForm(BaseModel):
                 "priority": "high",
                 "timestamp": "2025-05-02T10:15:30Z",
                 "draft_saved": False,
+                "read_receipt": True,
                 "draft_folder_name": None,
                 "draft_message_id": None
             }
