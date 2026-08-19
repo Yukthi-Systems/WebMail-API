@@ -242,16 +242,37 @@ def email_headers_cleanup(headers: dict) -> dict:
 
     for key, value in headers.items():
         if isinstance(value, str):
-            # Decode any encoded words in the header value
-            decoded_value = email.header.decode_header(value)
+            try:
+                # Decode any encoded words in the header value
+                decoded_value = email.header.decode_header(value)
 
-            cleaned_value = ''.join(
-                part.decode(encoding or 'utf-8') if isinstance(part, bytes) else part
-                for part, encoding in decoded_value
-            ).strip()
+                parts = []
+                for part, encoding in decoded_value:
+                    if not isinstance(part, bytes):
+                        parts.append(part)
+                        continue
 
-            # Escape any characters that can't be encoded in UTF-8 to avoid JSON serialization issues
-            cleaned_headers[key] = cleaned_value.encode('utf-8', errors='surrogateescape').decode('utf-8')
+                    # Try the declared charset first, then fall back to utf-8;
+                    # senders sometimes mislabel or corrupt the charset.
+                    for charset in (encoding, 'utf-8'):
+                        if not charset:
+                            continue
+                        try:
+                            parts.append(part.decode(charset))
+                            break
+                        except (UnicodeDecodeError, LookupError):
+                            continue
+                    else:
+                        parts.append(part.decode('utf-8', errors='replace'))
+
+                cleaned_value = ''.join(parts).strip()
+
+            except Exception as e:
+                logging.warning(f"Failed to decode header {key!r}, using raw value: {e}")
+                cleaned_value = value
+
+            # Replace any characters that can't be encoded in UTF-8 to avoid JSON serialization issues
+            cleaned_headers[key] = cleaned_value.encode('utf-8', errors='replace').decode('utf-8')
 
         else:
             cleaned_headers[key] = value  # Non-string values are left as is
@@ -277,23 +298,27 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
         # Iterate through each response part
         for response_part in data:
             if isinstance(response_part, tuple):
-                # Parse the email header
-                email_message = email.message_from_bytes(response_part[1])
-                email_id = response_part[0].decode().split()[0]  # Extract email ID from response
+                try:
+                    # Parse the email header
+                    email_message = email.message_from_bytes(response_part[1])
+                    email_id = response_part[0].decode().split()[0]  # Extract email ID from response
 
-                # Extract flags from the same response part
-                flags = []
-                if 'FLAGS' in response_part[0].decode():
-                    flags = response_part[0].decode().split('FLAGS (')[1].split(')')[0].split()
+                    # Extract flags from the same response part
+                    flags = []
+                    if 'FLAGS' in response_part[0].decode():
+                        flags = response_part[0].decode().split('FLAGS (')[1].split(')')[0].split()
 
-                # Add both headers and flags to the email dictionary
-                email_details = dict(email_message._headers)
-                email_details['FLAGS'] = flags  # Add the flags as a new key-value pair
-                email_details['id'] = email_id  # Add the email ID to the details
+                    # Add both headers and flags to the email dictionary
+                    email_details = dict(email_message._headers)
+                    email_details['FLAGS'] = flags  # Add the flags as a new key-value pair
+                    email_details['id'] = email_id  # Add the email ID to the details
 
-                # Clean up header values by doing basic decoding (e.g., for encoded words)
-                email_details = email_headers_cleanup(headers=email_details)
-                emails.append(email_details)
+                    # Clean up header values by doing basic decoding (e.g., for encoded words)
+                    email_details = email_headers_cleanup(headers=email_details)
+                    emails.append(email_details)
+                except Exception as e:
+                    # One malformed message shouldn't fail the whole batch fetch
+                    logging.error(f"Skipping unparsable email in range {id_range}: {e}", exc_info=True)
 
         if not emails:
             raise All_Exceptions(
