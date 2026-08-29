@@ -589,10 +589,11 @@ def delete_emails_permanently(connection: IMAP4_SSL, folder: str, email_ids: lis
         expunge_status, _ = connection.expunge()
 
         if expunge_status != 'OK':
-            return {"status": "Expunge failed", "uid_set": uid_set}
+            return {"status": "Expunge failed", "uid_set": uid_set, "expunge": str(expunge_status)}
 
         return {
             "status": "success",
+            "expunge": str(expunge_status),
             "deleted_count": len(email_ids),
             "uid_set": uid_set
         }
