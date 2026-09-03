@@ -407,6 +407,18 @@ def permanently_delete_emails(folder_path: str, email_ids: list[int], user: Curr
 
         expunge_status = resp.pop("expunge", "Expunge not performed")
 
+        if resp.get("status") != "success":
+            return JSONResponse(
+                content={
+                    "message": f"Failed to delete emails: {resp.get('status')}",
+                    "expunge_status": expunge_status,
+                    "folder_path": folder_path,
+                    "emails": email_ids,
+                    "responses": resp
+                },
+                status_code=status.HTTP_424_FAILED_DEPENDENCY
+            )
+
         return JSONResponse(
             content={
                 "message": "Emails deleted successfully",

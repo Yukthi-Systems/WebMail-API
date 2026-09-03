@@ -575,8 +575,8 @@ def delete_emails_permanently(connection: IMAP4_SSL, folder: str, email_ids: lis
         uid_set = compress_ranges(email_ids)
 
         # Bulk delete in ONE command
-        store_status, _ = connection.uid(
-            'STORE',
+
+        store_status, _ = connection.store(
             uid_set,
             '+FLAGS',
             r'(\Deleted)'
