@@ -280,19 +280,21 @@ def email_headers_cleanup(headers: dict) -> dict:
     return cleaned_headers
 
 
-def _part_has_attachment(part) -> bool:
+def _part_has_attachment(part, parent_sub_type: str = "") -> bool:
     """
     Walk a parsed BODYSTRUCTURE (imapclient BodyData) and return True if any part is an attachment.
     A part counts as an attachment if:
         - its Content-Disposition is "attachment", or
         - it is a forwarded email (message/rfc822), or
         - it has a filename/name and is not marked "inline" (inline parts are usually embedded images)
+    Except: a part inside multipart/related with a Content-ID is an embedded resource of the html body
+    (e.g. Outlook signature images - they have a name but no Content-Disposition), unless it is marked "attachment".
     """
-    if part.is_multipart:
-        return any(_part_has_attachment(sub_part) for sub_part in part[0])
-
     def _str(value) -> str:
         return value.decode(errors="ignore").lower() if isinstance(value, bytes) else str(value or "").lower()
+
+    if part.is_multipart:
+        return any(_part_has_attachment(sub_part, parent_sub_type=_str(part[1])) for sub_part in part[0])
 
     main_type, sub_type = _str(part[0]), _str(part[1])
     if (main_type, sub_type) == ("message", "rfc822"):
@@ -312,6 +314,10 @@ def _part_has_attachment(part) -> bool:
 
     if disposition_type == "attachment":
         return True
+
+    # Embedded resource of the html body (referenced as "cid:<content_id>")
+    if parent_sub_type == "related" and _str(part[3]).strip():
+        return False
 
     # Look for a filename in the disposition params or a name in the content-type params
     has_file_name = False
