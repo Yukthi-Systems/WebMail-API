@@ -19,7 +19,7 @@ list folders, and fetch emails from a specific folder.
 # <https://www.gnu.org/licenses/>.
 
 
-from src.utils.base.libraries import logging, IMAP4_SSL, parse_fetch_response, BodyData, email, status, re, datetime, calendar, base64, quopri
+from src.utils.base.libraries import logging, IMAP4_SSL, parse_fetch_response, BodyData, email, status, re, datetime, calendar, base64, quopri, Optional
 from src.utils.models import All_Exceptions, SearchMail
 
 
@@ -1158,14 +1158,10 @@ def get_email_details_by_message_id(imap_connection: IMAP4_SSL, message_ids: lis
     """
     imap_connection.select(folder, readonly=True)
 
-    uids: dict[str, str] = {}
-    for message_id in message_ids:
-        status_, data = imap_connection.search(None, f'(HEADER Message-ID "{message_id}")')
-        if status_ == "OK" and data != [b'']:
-            for uid in data[0].split():
-                uids[uid.decode()] = message_id
+    # Search all the Message-IDs in one go (the folder is scanned once instead of once per Message-ID)
+    email_ids = _search_message_ids(imap_connection=imap_connection, message_ids=message_ids)
 
-    if not uids:
+    if not email_ids:
         raise All_Exceptions(
             message="No emails found with the specified Message-IDs",
             status_code=status.HTTP_204_NO_CONTENT
@@ -1173,14 +1169,73 @@ def get_email_details_by_message_id(imap_connection: IMAP4_SSL, message_ids: lis
 
     findings = get_email_details(
         connection=imap_connection,
-        id_range=",".join(uid for uid in uids.keys()),
+        id_range=",".join(email_ids),
         folder_path=folder,
         full_headers=True
     )
 
-    # Add a new key 'Message-ID' to each finding
+    # Add a new key 'Message-ID' to each finding (the requested Message-ID it was found by)
+    uids = _map_findings_to_message_ids(findings=findings, message_ids=message_ids)
+    if uids is None:
+        # Could not match every finding from its headers - use the per Message-ID search (old behaviour)
+        uids = {}
+        for message_id in message_ids:
+            status_, data = imap_connection.search(None, f'(HEADER Message-ID {_imap_quote(message_id)})')
+            if status_ == "OK" and data != [b'']:
+                for uid in data[0].split():
+                    uids[uid.decode()] = message_id
+
     for finding in findings:
         uid = finding['id']
         finding['Message-ID'] = uids.get(uid, None)
 
     return findings
+
+
+def _imap_quote(value: str) -> str:
+    """Quote a string for an IMAP command (escape backslash and double quote)"""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _search_message_ids(imap_connection: IMAP4_SSL, message_ids: list[str], chunk_size: int = 50) -> list[str]:
+    """
+    Search emails by Message-ID with a single SEARCH per chunk of Message-IDs (OR of all of them).
+    Returns the email ids (sorted ascending, no duplicates).
+    """
+    unique_message_ids = list(dict.fromkeys(message_ids))
+    email_ids = set()
+
+    for start in range(0, len(unique_message_ids), chunk_size):
+        search_terms = [f"HEADER Message-ID {_imap_quote(message_id)}" for message_id in unique_message_ids[start:start + chunk_size]]
+
+        # IMAP OR takes 2 keys: "OR a OR b c" matches a, b or c
+        search_query = search_terms[-1]
+        for search_term in reversed(search_terms[:-1]):
+            search_query = f"OR {search_term} {search_query}"
+
+        status_, data = imap_connection.search(None, f"({search_query})")
+        if status_ == "OK" and data and data[0]:
+            email_ids.update(data[0].decode().split())
+
+    return sorted(email_ids, key=int)
+
+
+def _map_findings_to_message_ids(findings: list[dict], message_ids: list[str]) -> Optional[dict[str, str]]:
+    """
+    Match each finding to the requested Message-ID it was found by, using its Message-ID header.
+    IMAP HEADER search is a case-insensitive substring match, same is done here - if more than one requested
+    Message-ID matches, the last one wins (same as the per Message-ID search).
+    Returns None if any finding can not be matched.
+    """
+    uids = {}
+    for finding in findings:
+        header_value = next((str(value) for key, value in finding.items() if key.lower() == "message-id"), "").lower()
+        matched_message_id = None
+        for message_id in message_ids:
+            if message_id.lower() in header_value:
+                matched_message_id = message_id
+        if matched_message_id is None:
+            return None
+        uids[finding['id']] = matched_message_id
+
+    return uids
