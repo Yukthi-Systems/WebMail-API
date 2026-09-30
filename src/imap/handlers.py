@@ -19,7 +19,7 @@ list folders, and fetch emails from a specific folder.
 # <https://www.gnu.org/licenses/>.
 
 
-from src.utils.base.libraries import logging, IMAP4_SSL, email, status, re, datetime, calendar
+from src.utils.base.libraries import logging, IMAP4_SSL, parse_fetch_response, BodyData, email, status, re, datetime, calendar, base64, quopri
 from src.utils.models import All_Exceptions, SearchMail
 
 
@@ -280,6 +280,127 @@ def email_headers_cleanup(headers: dict) -> dict:
     return cleaned_headers
 
 
+def _part_has_attachment(part) -> bool:
+    """
+    Walk a parsed BODYSTRUCTURE (imapclient BodyData) and return True if any part is an attachment.
+    A part counts as an attachment if:
+        - its Content-Disposition is "attachment", or
+        - it is a forwarded email (message/rfc822), or
+        - it has a filename/name and is not marked "inline" (inline parts are usually embedded images)
+    """
+    if part.is_multipart:
+        return any(_part_has_attachment(sub_part) for sub_part in part[0])
+
+    def _str(value) -> str:
+        return value.decode(errors="ignore").lower() if isinstance(value, bytes) else str(value or "").lower()
+
+    main_type, sub_type = _str(part[0]), _str(part[1])
+    if (main_type, sub_type) == ("message", "rfc822"):
+        return True
+
+    # The Content-Disposition position depends on the part type (RFC 3501 - BODYSTRUCTURE)
+    if main_type == "text":
+        disposition_index = 9
+    else:
+        disposition_index = 8
+
+    disposition_type, disposition_params = "", None
+    if len(part) > disposition_index and isinstance(part[disposition_index], tuple) and part[disposition_index]:
+        disposition_type = _str(part[disposition_index][0])
+        if len(part[disposition_index]) > 1:
+            disposition_params = part[disposition_index][1]
+
+    if disposition_type == "attachment":
+        return True
+
+    # Look for a filename in the disposition params or a name in the content-type params
+    has_file_name = False
+    for params in (disposition_params, part[2]):
+        if isinstance(params, tuple):
+            param_keys = [_str(key) for key in params[0::2]]
+            if any(key in ("filename", "name") or key.startswith(("filename*", "name*")) for key in param_keys):
+                has_file_name = True
+                break
+
+    return has_file_name and disposition_type != "inline"
+
+
+def get_attachment_status(connection: IMAP4_SSL, id_range: str) -> dict[str, bool]:
+    """
+    Get the attachment status of emails in a range using BODYSTRUCTURE (no message body is downloaded).
+    Returns a dictionary with email ids as keys and True/False as values.
+    Never raises - on any failure it returns what it could parse (missing ids are treated as no attachment).
+    """
+    attachment_status = {}
+    try:
+        resp_status, data = connection.fetch(id_range, '(BODYSTRUCTURE)')
+        if resp_status != "OK":
+            logging.error(f"Failed to fetch BODYSTRUCTURE for range {id_range}: {resp_status}")
+            return attachment_status
+
+        for email_id, fetch_data in parse_fetch_response(data, normalise_times=False, uid_is_key=False).items():
+            try:
+                attachment_status[str(email_id)] = _part_has_attachment(BodyData.create(fetch_data[b'BODYSTRUCTURE']))
+            except Exception as e:
+                logging.error(f"Failed to parse BODYSTRUCTURE of email {email_id} in range {id_range}: {e}", exc_info=True)
+
+    except Exception as e:
+        logging.error(f"Failed to get attachment status for range {id_range}: {e}", exc_info=True)
+
+    return attachment_status
+
+
+EMAIL_SORT_KEYS = {
+    "date": "DATE",         # Date header of the email (falls back to arrival date if missing)
+    "arrival": "ARRIVAL",   # When the email arrived in the mailbox
+    "from": "FROM",
+    "subject": "SUBJECT",
+    "size": "SIZE"
+}
+
+EMAIL_FILTER_KEYS = {
+    "all": "ALL",
+    "unread": "UNSEEN",
+    "read": "SEEN",
+    "flagged": "FLAGGED",
+    "unflagged": "UNFLAGGED"
+}
+
+
+def get_sorted_email_ids(connection: IMAP4_SSL, folder_path: str, sort_by: str, sort_order: str, filter_by: str) -> list[str]:
+    """
+    Get the email ids of a folder filtered and sorted on the IMAP server (RFC 5256 SORT) - no email data is downloaded.
+    Falls back to SEARCH (arrival order) if the server does not support SORT.
+    Returns the list of email ids in the requested order.
+    """
+    connection.select(mailbox=folder_path, readonly=True)
+
+    search_key = EMAIL_FILTER_KEYS[filter_by]
+
+    # Always sort ascending and reverse here for desc - IMAP breaks ties (same date/sender) by mailbox order
+    # ascending even with REVERSE, reversing the whole list keeps the newest email first among ties
+    try:
+        resp_status, data = connection.sort(f"({EMAIL_SORT_KEYS[sort_by]})", "UTF-8", search_key)
+        if resp_status == "OK":
+            email_ids = data[0].decode().split() if data and data[0] else []
+            return email_ids[::-1] if sort_order == "desc" else email_ids
+        logging.error(f"IMAP SORT failed for folder {folder_path}: {resp_status}; {data}")
+
+    except Exception as e:
+        logging.warning(f"IMAP SORT not available for folder {folder_path}, falling back to SEARCH: {e}")
+
+    # Fallback - SEARCH returns ids in arrival order
+    resp_status, data = connection.search(None, search_key)
+    if resp_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to search emails: {resp_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+    email_ids = data[0].decode().split() if data and data[0] else []
+    return email_ids[::-1] if sort_order == "desc" else email_ids
+
+
 def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, full_headers: bool) -> list[dict]:
     """
     Get headers and flags of specific emails in a range.
@@ -326,6 +447,11 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
                 status_code=status.HTTP_204_NO_CONTENT
             )
 
+        # Add attachment status (separate FETCH so the header parsing above is not affected)
+        attachment_status = get_attachment_status(connection=connection, id_range=id_range)
+        for email_details in emails:
+            email_details['has_attachment'] = attachment_status.get(email_details['id'], False)
+
         # Return the list of email details
         return emails
 
@@ -354,6 +480,245 @@ def get_raw_email(connection: IMAP4_SSL, email_id: str, folder: str, read_only: 
         message=f"Failed to fetch raw email: {fetch_status}; {str(data)}",
         status_code=status.HTTP_424_FAILED_DEPENDENCY
     )
+
+
+def _bs_str(value) -> str:
+    """Convert a BODYSTRUCTURE value (bytes / str / None) to str"""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return "" if value is None else str(value)
+
+
+def _bs_params(params) -> dict:
+    """
+    Convert BODYSTRUCTURE params (key, value, key, value ...) to a dict with lower-case keys.
+    Decodes RFC 2231 (filename*=utf-8''...) and RFC 2047 (=?utf-8?b?...?=) encoded values.
+    """
+    if not isinstance(params, tuple):
+        return {}
+
+    raw_params = [(_bs_str(key).lower(), _bs_str(value)) for key, value in zip(params[0::2], params[1::2])]
+    result = {}
+    try:
+        # decode_params expects the first item to be the main value, it is skipped in the result
+        for key, value in email.utils.decode_params([("", "")] + raw_params)[1:]:
+            result[key] = email.utils.unquote(email.utils.collapse_rfc2231_value(value))
+    except Exception:
+        result = dict(raw_params)
+
+    for key, value in result.items():
+        if "=?" in value:
+            try:
+                result[key] = str(email.header.make_header(email.header.decode_header(value)))
+            except Exception:
+                pass
+
+    return result
+
+
+def _bs_leaf_parts(part, part_id: str = "") -> list[dict]:
+    """
+    Flatten a BODYSTRUCTURE (imapclient BodyData) into a list of leaf parts with their IMAP section ids (e.g. "1", "1.2").
+    message/rfc822 parts (forwarded emails) are not opened, they are treated as a single part.
+    """
+    if part.is_multipart:
+        leaf_parts = []
+        for index, sub_part in enumerate(part[0], start=1):
+            leaf_parts.extend(_bs_leaf_parts(sub_part, f"{part_id}.{index}" if part_id else str(index)))
+        return leaf_parts
+
+    main_type, sub_type = _bs_str(part[0]).lower(), _bs_str(part[1]).lower()
+
+    # The Content-Disposition position depends on the part type (RFC 3501 - BODYSTRUCTURE)
+    if main_type == "text":
+        disposition_index = 9
+    elif (main_type, sub_type) == ("message", "rfc822"):
+        disposition_index = 11
+    else:
+        disposition_index = 8
+
+    disposition_type, disposition_params = "", {}
+    if len(part) > disposition_index and isinstance(part[disposition_index], tuple) and part[disposition_index]:
+        disposition_type = _bs_str(part[disposition_index][0]).lower()
+        if len(part[disposition_index]) > 1:
+            disposition_params = _bs_params(part[disposition_index][1])
+
+    content_params = _bs_params(part[2])
+    content_id = _bs_str(part[3]).strip("<>") or None
+    encoded_size = part[6] if isinstance(part[6], int) else 0
+    encoding = _bs_str(part[5]).lower()
+
+    return [{
+        "part_id": part_id or "1",  # A single part email has its body at section 1
+        "content_type": f"{main_type}/{sub_type}",
+        "charset": content_params.get("charset"),
+        "encoding": encoding,
+        "filename": disposition_params.get("filename") or content_params.get("name"),
+        "disposition": disposition_type or None,
+        "content_id": content_id,
+        "encoded_size": encoded_size,
+        # base64 is ~33% bigger than the real file
+        "size": encoded_size * 3 // 4 if encoding == "base64" else encoded_size
+    }]
+
+
+def _part_filename(leaf_part: dict) -> str:
+    """Filename of a part, or a generated one if the email does not give one"""
+    if leaf_part["filename"]:
+        return leaf_part["filename"]
+    if leaf_part["content_type"] == "message/rfc822":
+        return f"forwarded-{leaf_part['part_id']}.eml"
+    return f"attachment-{leaf_part['part_id']}.{leaf_part['content_type'].split('/')[-1]}"
+
+
+def _decode_part_content(content: bytes, encoding: str) -> bytes:
+    """Decode the Content-Transfer-Encoding (base64 / quoted-printable) of a part"""
+    if content is None:
+        return b""
+    if encoding == "base64":
+        return base64.b64decode(re.sub(rb"[^A-Za-z0-9+/=]", b"", content) + b"==", validate=False)
+    if encoding == "quoted-printable":
+        return quopri.decodestring(content)
+    return content
+
+
+def _decode_part_text(content: bytes, charset: str) -> str:
+    """Decode text bytes using the charset of the part, fall back to utf-8"""
+    for candidate in (charset, "utf-8"):
+        if not candidate:
+            continue
+        try:
+            return content.decode(candidate)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+def _fetch_email_structure(connection: IMAP4_SSL, email_id: str, with_headers: bool) -> dict:
+    """FETCH the flags, BODYSTRUCTURE and (optionally) the headers of a single email"""
+    query_string = "(FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])" if with_headers else "(BODYSTRUCTURE)"
+    try:
+        resp_status, data = connection.fetch(email_id, query_string)
+    except connection.error as e:
+        # The IMAP server rejects ids that do not exist in the folder (e.g. "Invalid messageset")
+        raise All_Exceptions(
+            message=f"Email not found: {email_id}; {e}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+    if resp_status != "OK" or not data or data == [None]:
+        raise All_Exceptions(
+            message=f"Email not found: {email_id}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    for fetch_data in parse_fetch_response(data, normalise_times=False, uid_is_key=False).values():
+        if b"BODYSTRUCTURE" in fetch_data:
+            return fetch_data
+
+    raise All_Exceptions(
+        message=f"Email not found: {email_id}",
+        status_code=status.HTTP_404_NOT_FOUND
+    )
+
+
+def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_read: bool) -> dict:
+    """
+    Get an email for viewing - headers, flags, the text/html body and the list of attachments.
+    Only the body parts are downloaded, attachments are NOT downloaded (use get_email_attachment for that).
+    """
+    connection.select(mailbox=folder, readonly=not mark_as_read)
+
+    fetch_data = _fetch_email_structure(connection=connection, email_id=email_id, with_headers=True)
+    leaf_parts = _bs_leaf_parts(BodyData.create(fetch_data[b"BODYSTRUCTURE"]))
+
+    # Body parts are text/plain and text/html parts that are not attachments, everything else is an attachment
+    body_parts, attachments = [], []
+    for leaf_part in leaf_parts:
+        if leaf_part["content_type"] in ("text/plain", "text/html") and leaf_part["disposition"] != "attachment" and not leaf_part["filename"]:
+            body_parts.append(leaf_part)
+        else:
+            attachments.append(leaf_part)
+
+    # Download only the body parts
+    body = {"html": None, "text": None}
+    if body_parts:
+        resp_status, data = connection.fetch(email_id, "(" + " ".join(f"BODY.PEEK[{part['part_id']}]" for part in body_parts) + ")")
+        if resp_status != "OK":
+            raise All_Exceptions(
+                message=f"Failed to fetch email body: {resp_status}; {str(data)}",
+                status_code=status.HTTP_424_FAILED_DEPENDENCY
+            )
+        body_data = next(iter(parse_fetch_response(data, normalise_times=False, uid_is_key=False).values()), {})
+
+        # Join the parts of the same type in order (some emails have more than one text part)
+        for body_part in body_parts:
+            content = body_data.get(f"BODY[{body_part['part_id']}]".encode())
+            text = _decode_part_text(_decode_part_content(content, body_part["encoding"]), body_part["charset"])
+            body_type = "html" if body_part["content_type"] == "text/html" else "text"
+            body[body_type] = text if body[body_type] is None else body[body_type] + "\n" + text
+
+    if mark_as_read:
+        connection.store(email_id, "+FLAGS", "\\Seen")
+
+    # Same header cleanup as the email listing
+    email_message = email.message_from_bytes(fetch_data.get(b"BODY[HEADER]") or b"")
+    headers = email_headers_cleanup(headers=dict(email_message._headers))
+
+    flags = [_bs_str(flag) for flag in fetch_data.get(b"FLAGS", ())]
+    if mark_as_read and "\\Seen" not in flags:
+        flags.append("\\Seen")
+
+    return {
+        "id": email_id,
+        "folder_path": folder,
+        "headers": headers,
+        "flags": flags,
+        "body": body,
+        "has_attachment": _part_has_attachment(BodyData.create(fetch_data[b"BODYSTRUCTURE"])),
+        "attachments": [
+            {
+                "part_id": attachment["part_id"],
+                "filename": _part_filename(attachment),
+                "content_type": attachment["content_type"],
+                "size": attachment["size"],
+                "content_id": attachment["content_id"],
+                # Inline parts (e.g. embedded images) are referenced from the html body as "cid:<content_id>"
+                "is_inline": attachment["disposition"] != "attachment" and attachment["content_id"] is not None
+            }
+            for attachment in attachments
+        ]
+    }
+
+
+def get_email_attachment(connection: IMAP4_SSL, email_id: str, folder: str, part_id: str) -> dict:
+    """
+    Download a single attachment (part) of an email.
+    Returns a dict with content (decoded bytes), content_type and filename.
+    """
+    connection.select(mailbox=folder, readonly=True)
+
+    fetch_data = _fetch_email_structure(connection=connection, email_id=email_id, with_headers=False)
+    leaf_parts = {leaf_part["part_id"]: leaf_part for leaf_part in _bs_leaf_parts(BodyData.create(fetch_data[b"BODYSTRUCTURE"]))}
+    if part_id not in leaf_parts:
+        raise All_Exceptions(
+            message=f"Attachment part {part_id} not found in email {email_id}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+    attachment = leaf_parts[part_id]
+
+    resp_status, data = connection.fetch(email_id, f"(BODY.PEEK[{part_id}])")
+    if resp_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to fetch attachment: {resp_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+    part_data = next(iter(parse_fetch_response(data, normalise_times=False, uid_is_key=False).values()), {})
+
+    return {
+        "content": _decode_part_content(part_data.get(f"BODY[{part_id}]".encode()), attachment["encoding"]),
+        "content_type": attachment["content_type"],
+        "filename": _part_filename(attachment)
+    }
 
 
 def parse_quota_response(quota_response: str) -> dict:
@@ -669,6 +1034,47 @@ def _build_search_criteria(query: dict) -> str:
     return criteria
 
 
+def _paginate_sorted_search(connection: IMAP4_SSL, search_criteria: SearchMail, data: list) -> dict:
+    """Paginate the result of an IMAP SORT for search_emails, keeping the sorted order in the result"""
+    # Sorted ascending on the server, reversed here for desc so ties keep the newest email first
+    email_ids = data[0].decode().split() if data and data[0] else []
+    if search_criteria.sort_order != "asc":
+        email_ids = email_ids[::-1]
+
+    if not email_ids:
+        return {
+            "total_count": 0,
+            "folder_path": search_criteria.folder,
+            "data": []
+        }
+
+    page, limit = search_criteria.page or 1, search_criteria.limit or 50
+    page_email_ids = email_ids[(page - 1) * limit: page * limit]
+    if not page_email_ids:
+        return {
+            "total_count": len(email_ids),
+            "folder_path": search_criteria.folder,
+            "data": []
+        }
+
+    email_details = get_email_details(
+        connection=connection,
+        id_range=",".join(page_email_ids),
+        folder_path=search_criteria.folder,
+        full_headers=search_criteria.full_headers
+    )
+
+    # IMAP FETCH returns emails in id order, put them back in the sorted order
+    sorted_position = {email_id: position for position, email_id in enumerate(page_email_ids)}
+    email_details.sort(key=lambda email_detail: sorted_position.get(email_detail["id"], len(sorted_position)))
+
+    return {
+        "total_count": len(email_ids),
+        "folder_path": search_criteria.folder,
+        "data": email_details
+    }
+
+
 def search_emails(connection: IMAP4_SSL, search_criteria: SearchMail) -> dict:
     """
     Search Emails and return results
@@ -688,6 +1094,17 @@ def search_emails(connection: IMAP4_SSL, search_criteria: SearchMail) -> dict:
     )
 
     connection.select(mailbox=search_criteria.folder, readonly=True)
+
+    # Sorted search (only when requested) - the whole result is sorted on the IMAP server before pagination
+    if search_criteria.sort_by:
+        try:
+            resp_status, data = connection.sort(f"({EMAIL_SORT_KEYS[search_criteria.sort_by]})", "UTF-8", search_query)
+            if resp_status == "OK":
+                return _paginate_sorted_search(connection=connection, search_criteria=search_criteria, data=data)
+            logging.error(f"IMAP SORT failed for search in folder {search_criteria.folder}: {resp_status}; {data}")
+        except Exception as e:
+            logging.warning(f"IMAP SORT not available for search in folder {search_criteria.folder}, using the old behaviour: {e}")
+
     result = connection.search(None, search_query)
 
     if result[0] != "OK":

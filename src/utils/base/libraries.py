@@ -35,12 +35,17 @@ from sievelib.factory import FiltersSet as SieveFiltersSet
 from sievelib.managesieve import Client as SieveClient
 from sievelib import parser as SieveParser
 from imaplib import IMAP4_SSL
+from imapclient.response_parser import parse_fetch_response
+from imapclient.response_types import BodyData
 import smtplib
 import email
+import email.utils
+import email.header
+import quopri
 
 
 # DB libraries
-from typing import Annotated, AsyncGenerator, Optional, TypeAlias, List
+from typing import Annotated, AsyncGenerator, Optional, TypeAlias, List, Literal
 from contextlib import asynccontextmanager
 import aiomcache
 import requests
@@ -54,6 +59,7 @@ from threading import Thread
 from functools import wraps
 import calendar
 import base64
+from urllib.parse import quote as url_quote
 import orjson
 import time
 import pika

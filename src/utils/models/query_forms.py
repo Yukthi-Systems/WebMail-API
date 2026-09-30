@@ -18,7 +18,7 @@ This module contains all the query forms for the application
 # <https://www.gnu.org/licenses/>.
 
 
-from src.utils.base.libraries import BaseModel, Field, List, Optional
+from src.utils.base.libraries import BaseModel, Field, List, Optional, Literal
 
 
 class AuthRequest(BaseModel):
@@ -206,6 +206,8 @@ class SearchMail(BaseModel):
     limit: Optional[int] = Field(50, title="Limit", description="Maximum number of emails to return")
     page: Optional[int] = Field(1, title="Page", description="Page number for pagination")
     full_headers: Optional[bool] = Field(False, title="Full Headers", description="Whether to fetch full email headers")
+    sort_by: Optional[Literal["date", "arrival", "from", "subject", "size"]] = Field(None, title="Sort By", description="Sort the results on the IMAP server before pagination (if not given, the old behaviour is used)")
+    sort_order: Optional[Literal["desc", "asc"]] = Field("desc", title="Sort Order", description="Sort order when sort_by is given")
 
     class Config:
         json_schema_extra = {

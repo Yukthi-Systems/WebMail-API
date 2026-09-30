@@ -23,13 +23,18 @@ from src.utils.base.libraries import (
     JSONResponse,
     UploadFile,
     APIRouter,
+    url_quote,
+    Optional,
+    Response,
+    Literal,
     status,
+    re,
     Form,
     File
 )
 from src.database import get_all_templates, PostgresDep, create_template, delete_template, edit_template, get_template
 from src.main import CurrentUser, send_mail_rabbit, draft_mail_rabbit
-from src.utils.models import SendMailForm, SearchMail, EmailTemplate
+from src.utils.models import SendMailForm, SearchMail, EmailTemplate, All_Exceptions
 from src.imap import (
     get_imap_connection_from_user_data,
     get_email_details_by_message_id,
@@ -42,7 +47,10 @@ from src.imap import (
     mark_emails_as_read,
     parse_imap_response,
     mark_emails_as_read,
+    get_sorted_email_ids,
+    get_email_attachment,
     get_email_details,
+    get_email_view,
     get_raw_email,
     search_emails
 )
@@ -53,12 +61,40 @@ router = APIRouter()
 
 # Get all the emails in a folder
 @router.get("/fetch/{batch_size}/{page_number}", response_class=JSONResponse, tags=["E-Mail"], summary="Fetch all emails from a given folder path")
-def fetch_all_emails(folder_path: str, full_headers: bool, batch_size: int, page_number: int, user: CurrentUser) -> JSONResponse:
-    """Fetch all emails from a given folder path"""
+def fetch_all_emails(
+    folder_path: str,
+    full_headers: bool,
+    batch_size: int,
+    page_number: int,
+    user: CurrentUser,
+    sort_by: Optional[Literal["date", "arrival", "from", "subject", "size"]] = None,
+    sort_order: Literal["desc", "asc"] = "desc",
+    filter_by: Literal["all", "unread", "read", "flagged", "unflagged"] = "all"
+) -> JSONResponse:
+    """
+    Fetch all emails from a given folder path
+    Optional (sorting and filtering is done on the IMAP server):
+        sort_by: date (Date header), arrival (received time), from, subject, size - if not given, the old behaviour is used
+        sort_order: desc (default) or asc
+        filter_by: all (default), unread, read, flagged, unflagged
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     # Fetch the emails
     try:
+        # Sorted / filtered listing (only when requested, otherwise the old behaviour below is used)
+        if sort_by is not None or filter_by != "all":
+            return _fetch_sorted_emails(
+                imap_connection=imap_connection,
+                folder_path=folder_path,
+                full_headers=full_headers,
+                batch_size=batch_size,
+                page_number=page_number,
+                sort_by=sort_by or "date",
+                sort_order=sort_order,
+                filter_by=filter_by
+            )
+
         total_count = int(parse_imap_response(
             imap_response=imap_connection.select(mailbox=folder_path, readonly=True),
             operation_name="Fetch Emails"
@@ -121,6 +157,71 @@ def fetch_all_emails(folder_path: str, full_headers: bool, batch_size: int, page
         )
 
 
+def _fetch_sorted_emails(imap_connection, folder_path: str, full_headers: bool, batch_size: int, page_number: int, sort_by: str, sort_order: str, filter_by: str) -> JSONResponse:
+    """Fetch a page of emails from a folder, filtered and sorted on the IMAP server"""
+    email_ids = get_sorted_email_ids(
+        connection=imap_connection,
+        folder_path=folder_path,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        filter_by=filter_by
+    )
+    total_count = len(email_ids)
+    sort_details = {"sort_by": sort_by, "sort_order": sort_order, "filter_by": filter_by}
+
+    if total_count == 0:
+        return JSONResponse(
+            content={
+                "message": "No emails found in the specified folder",
+                "folder_path": folder_path,
+                "total_count": total_count,
+                "total_pages": 0,
+                "batch_size": batch_size,
+                **sort_details,
+                "emails": []
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    total_batches = total_count // batch_size + (total_count % batch_size > 0)
+    if page_number > total_batches:
+        return JSONResponse(
+            content={"message": "Page number exceeds total pages"},
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+    if page_number < 1:
+        return JSONResponse(
+            content={"message": "Page number must be greater than 0"},
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Fetch only the emails of the requested page
+    page_email_ids = email_ids[(page_number - 1) * batch_size: page_number * batch_size]
+    email_details = get_email_details(
+        connection=imap_connection,
+        id_range=",".join(page_email_ids),
+        folder_path=folder_path,
+        full_headers=full_headers
+    )
+
+    # IMAP FETCH returns emails in id order, put them back in the sorted order
+    sorted_position = {email_id: position for position, email_id in enumerate(page_email_ids)}
+    email_details.sort(key=lambda email_detail: sorted_position.get(email_detail["id"], len(sorted_position)))
+
+    return JSONResponse(
+        content={
+            "message": "Emails fetched successfully",
+            "folder_path": folder_path,
+            "total_count": total_count,
+            "total_pages": total_batches,
+            "batch_size": batch_size,
+            **sort_details,
+            "emails": email_details
+        },
+        status_code=status.HTTP_200_OK
+    )
+
+
 # Get Raw Email
 @router.get("/raw/{email_id}", response_class=PlainTextResponse, tags=["E-Mail"], summary="Get raw email by ID")
 def get_raw_email_as_plain_text(email_id: str, folder_path: str, mark_as_read: bool, user: CurrentUser) -> PlainTextResponse:
@@ -148,6 +249,77 @@ def get_raw_email_as_plain_text(email_id: str, folder_path: str, mark_as_read: b
     except Exception as e:
         return PlainTextResponse(
             content=f"Failed to fetch raw email: {str(e)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
+# View an email - body only, attachments are listed but not downloaded
+@router.get("/view/{email_id}", response_class=JSONResponse, tags=["E-Mail"], summary="View an email (body only, attachments are downloaded separately)")
+def view_email(email_id: str, folder_path: str, mark_as_read: bool, user: CurrentUser) -> JSONResponse:
+    """
+    View an email - returns the headers, flags, text/html body and the list of attachments.
+    Attachments are NOT downloaded, use /email/attachment/{email_id}/{part_id} to download one.
+    Inline images in the html body are referenced as "cid:<content_id>" - match them with the content_id of the attachments.
+    """
+    if not email_id.isdigit():
+        raise All_Exceptions(message="Invalid email ID", status_code=status.HTTP_400_BAD_REQUEST)
+
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        return JSONResponse(
+            content={
+                "message": "Email fetched successfully",
+                **get_email_view(connection=imap_connection, email_id=email_id, folder=folder_path, mark_as_read=mark_as_read)
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to fetch email: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
+# Download a single attachment of an email
+@router.get("/attachment/{email_id}/{part_id}", tags=["E-Mail"], summary="Download a single attachment of an email")
+def download_email_attachment(email_id: str, part_id: str, folder_path: str, user: CurrentUser, inline: bool = False) -> Response:
+    """
+    Download a single attachment of an email.
+    part_id comes from the attachments list of /email/view/{email_id}
+    inline: true to show it in the browser (e.g. images, pdf), false to download it as a file (default)
+    """
+    if not email_id.isdigit() or not re.fullmatch(r"\d+(\.\d+)*", part_id):
+        raise All_Exceptions(message="Invalid email ID or part ID", status_code=status.HTTP_400_BAD_REQUEST)
+
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        attachment = get_email_attachment(connection=imap_connection, email_id=email_id, folder=folder_path, part_id=part_id)
+
+        # ASCII fallback filename for old clients + the real (utf-8) filename (RFC 6266)
+        ascii_filename = attachment["filename"].encode("ascii", errors="replace").decode().replace("?", "_").replace('"', "_")
+        disposition = "inline" if inline else "attachment"
+
+        return Response(
+            content=attachment["content"],
+            status_code=status.HTTP_200_OK,
+            media_type=attachment["content_type"],
+            headers={
+                "Content-Disposition": f"{disposition}; filename=\"{ascii_filename}\"; filename*=UTF-8''{url_quote(attachment['filename'])}"
+            }
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to fetch attachment: {str(e)}"},
             status_code=status.HTTP_424_FAILED_DEPENDENCY
         )
 
