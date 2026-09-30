@@ -25,3 +25,5 @@ logs/
 # Other Ignore Files/Paths should be added here
 temp/
 *.db
+
+temp/
