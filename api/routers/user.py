@@ -22,6 +22,7 @@ from src.utils.base.libraries import (
     JSONResponse,
     APIRouter,
     Request,
+    logging,
     status,
     orjson
 )
@@ -42,13 +43,25 @@ from src.database import (
     admin_get_all_domains,
     admin_get_domain_info
 )
-from src.main import validate_smtp_details, validate_imap_details, CurrentUser, validate_recaptcha
+from src.main import check_smtp_login, check_imap_login, CurrentUser, validate_recaptcha
 from src.utils.base.constants import MAX_AGE_OF_CACHE, API_KEY, API_COOKIE_DOMAIN
 from src.utils.models import All_Exceptions, AuthRequest
 
 
 # Router
 router = APIRouter()
+
+
+# User friendly login error messages (the technical reason is written to the logs)
+LOGIN_ERROR_MESSAGES = {
+    "recaptcha_failed": "Verification failed. Please refresh the page and try again.",
+    "domain_not_found": "This email domain isn't set up for WebMail. Please contact your administrator.",
+    "domain_inactive": "This account is currently disabled. Please contact your administrator.",
+    "ip_blocked": "Sign-in from your current location isn't allowed. Please contact your administrator.",
+    "wrong_credentials": "Incorrect email or password.",
+    "server_unreachable": "We couldn't reach your mail server. Please try again in a few minutes.",
+    "smtp_failed": "Your account can't send email right now. Please contact your administrator."
+}
 
 
 # Login to WebMail - Validate IMAP and SMTP credentials (Create a session)
@@ -60,21 +73,23 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
     if not validate_recaptcha(token=data.recaptcha_token):
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"message": "Recaptcha validation failed - Are you a bot?"}
+            content={"message": LOGIN_ERROR_MESSAGES["recaptcha_failed"]}
         )
 
     # Get IMAP and SMTP details from DB if domain is present
     server_details = await get_domain_details(db_session=PgDB, domain=data.domain)
     if not server_details:
+        logging.warning(f"Login: domain {data.domain} is not registered (user {data.email})")
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"message": "Invalid domain, contact admin to register the domain"}
+            content={"message": LOGIN_ERROR_MESSAGES["domain_not_found"]}
         )
     
     if not server_details["is_active"]:
+        logging.warning(f"Login: domain {data.domain} is inactive (user {data.email})")
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"message": "Domain is inactive, contact admin to activate the domain"}
+            content={"message": LOGIN_ERROR_MESSAGES["domain_inactive"]}
         )
 
     # Check if the user is V2 User or not (That means the user is our platform user)
@@ -82,45 +97,59 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
     v2_domain_id, v2_mailbox_id = None, None
 
     if is_v2_user:
+        # Find the MailBox ID and Domain ID for the user from the DB (For V2 Users)
+        # Checked before the IP check, so a missing user is not reported as a blocked IP
+        v2_mailbox_id, v2_domain_id = await get_v2_ids(admin_db_session=AdminPgDB, user_email=data.email)
+        if not v2_domain_id or not v2_mailbox_id:
+            # Same message as a wrong password - do not reveal which email addresses exist
+            logging.warning(f"Login: user {data.email} not found in the V2 admin DB")
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"message": LOGIN_ERROR_MESSAGES["wrong_credentials"]}
+            )
+
         # Check if IP is blocked or not
         ip_validation_result = await validate_origin_ip_blocked(admin_db_session=AdminPgDB, ip_address=request.headers.get('X-Real-IP'), user_email=data.email)
         if not ip_validation_result:    # If it returns False, that means the IP is blocked
+            logging.warning(f"Login: access blocked for user {data.email} from IP {request.headers.get('X-Real-IP')}")
             return JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
-                content={"message": "Access from this IP or Region is blocked, contact admin for more details"}
+                content={"message": LOGIN_ERROR_MESSAGES["ip_blocked"]}
             )
 
-        # Find the MailBox ID and Domain ID for the user from the DB (For V2 Users)
-        v2_mailbox_id, v2_domain_id = await get_v2_ids(admin_db_session=AdminPgDB, user_email=data.email)
-        if not v2_domain_id or not v2_mailbox_id:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={"message": "User not found in the system, contact admin to register"}
-            )
-
-    # Validate the IMAP and SMTP details
-    is_valid_imap = validate_imap_details(
+    # Validate the IMAP details (SMTP is checked only if IMAP login works)
+    imap_result = check_imap_login(
         imap_server=server_details["imap_server"],
         imap_port=server_details["imap_port"],
         imap_user=data.email,
         imap_password=data.password
     )
-    is_valid_smtp = validate_smtp_details(
+    if imap_result == "auth_failed":
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["wrong_credentials"]}
+        )
+    if imap_result != "ok":
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"message": LOGIN_ERROR_MESSAGES["server_unreachable"]}
+        )
+
+    smtp_result = check_smtp_login(
         smtp_server=server_details["smtp_server"],
         smtp_port=server_details["smtp_port"],
         smtp_user=data.email,
         smtp_password=data.password
     )
-
-    if not is_valid_imap:
+    if smtp_result == "unreachable":
         return JSONResponse(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"message": "Invalid IMAP credentials"}
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"message": LOGIN_ERROR_MESSAGES["server_unreachable"]}
         )
-    if not is_valid_smtp:
+    if smtp_result != "ok":
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"message": "Invalid SMTP credentials"}
+            content={"message": LOGIN_ERROR_MESSAGES["smtp_failed"]}
         )
     
     # Create a session in the cache

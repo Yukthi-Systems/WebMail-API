@@ -22,6 +22,15 @@ from src.utils.base.libraries import logging, IMAP4_SSL, time, status
 from src.utils.models import All_Exceptions
 
 
+# IMAP response codes (RFC 5530) of a temporary login problem on the server side - not a wrong password
+TEMPORARY_LOGIN_ERROR_CODES = ("[UNAVAILABLE]", "[LIMIT]", "[INUSE]", "[SERVERBUG]")
+
+
+def is_login_rejected(error: Exception) -> bool:
+    """True if the IMAP server rejected the login (wrong email / password), False for network or temporary server errors"""
+    return isinstance(error, IMAP4_SSL.error) and not any(code in str(error).upper() for code in TEMPORARY_LOGIN_ERROR_CODES)
+
+
 def get_imap_connection(imap_user: str, imap_password: str, imap_server: str, imap_port: int) -> IMAP4_SSL:
     """
     Retrieves an IMAP connection from the pool if available and not expired.
@@ -39,8 +48,10 @@ def get_imap_connection(imap_user: str, imap_password: str, imap_server: str, im
         except Exception as e:
             logging.error(f"Attempt {attempt}: Error connecting to IMAP server: {imap_server}:{imap_port} for user {imap_user}: {e}", exc_info=True)
 
-            if attempt == MAX_RETRIES:
-                raise All_Exceptions(f"Failed to connect to IMAP server: {imap_server}:{imap_port} for user {imap_user} after {MAX_RETRIES} attempts: {e}", status.HTTP_429_TOO_MANY_REQUESTS)
+            # Do not retry a rejected login (wrong password) - retrying only delays the error and
+            # counts as more failed logins on the mail server (brute force protection / fail2ban)
+            if attempt == MAX_RETRIES or is_login_rejected(e):
+                raise All_Exceptions(f"Failed to connect to IMAP server: {imap_server}:{imap_port} for user {imap_user} after {attempt} attempt(s): {e}", status.HTTP_429_TOO_MANY_REQUESTS)
             else:
                 # Exponential backoff: [800ms, 1600ms, 3200ms]
                 time.sleep(retry_delay_ms / 1000)  # Convert ms to seconds

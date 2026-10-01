@@ -18,10 +18,10 @@ Basic functions required for the project are defined here
 # <https://www.gnu.org/licenses/>.
 
 
-from .utils.base.libraries import smtplib, logging, Request, orjson, status, Annotated, Depends, pika, uuid, datetime, timezone, requests, UploadFile, base64
+from .utils.base.libraries import smtplib, IMAP4_SSL, logging, Request, orjson, status, Annotated, Depends, pika, uuid, datetime, timezone, requests, UploadFile, base64
 from .utils.base.constants import RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_VIRTUAL_HOST, RABBITMQ_USERNAME, RABBITMQ_PASSWORD, RABBITMQ_EXCHANGE, RABBITMQ_ROUTING_KEY, GOOGLE_RECAPTCHA_PROJECT_ID, GOOGLE_RECAPTCHA_API_KEY, GOOGLE_RECAPTCHA_SITE_KEY, LOCAL_SMTP_HOST_NAME, SMTP_CONNECTION_TIMEOUT
 from .utils.models import All_Exceptions, SendMailForm
-from .imap import get_imap_connection
+from .imap import get_imap_connection, is_login_rejected
 from .database import MemcachedDep
 
 
@@ -66,6 +66,82 @@ def validate_imap_details(imap_server: str, imap_port: int, imap_user: str, imap
     else:
         logging.error("Failed to establish IMAP connection")
         return False
+
+
+def check_imap_login(imap_server: str, imap_port: int, imap_user: str, imap_password: str) -> str:
+    """
+    Check IMAP login details for the login page.
+    Returns "ok", "auth_failed" (wrong email / password) or "unreachable" (server down / network error).
+    A rejected login is not retried (to not trigger the brute force protection of the mail server).
+    """
+    for attempt in range(1, 3):
+        try:
+            connection = IMAP4_SSL(host=imap_server, port=imap_port, timeout=30)
+        except Exception as e:
+            logging.error(f"Login check attempt {attempt}: Could not connect to IMAP server {imap_server}:{imap_port} for user {imap_user}: {e}")
+            continue
+
+        try:
+            connection.login(user=imap_user, password=imap_password)
+            return "ok"
+
+        except Exception as e:
+            if is_login_rejected(e):
+                logging.warning(f"Login check: IMAP login rejected for user {imap_user} on {imap_server}:{imap_port}: {e}")
+                return "auth_failed"
+            # Network error or temporary server problem ([UNAVAILABLE], [LIMIT] ...) - try once more
+            logging.error(f"Login check attempt {attempt}: IMAP error for user {imap_user} on {imap_server}:{imap_port}: {e}", exc_info=True)
+
+        finally:
+            try:
+                connection.logout()
+            except Exception:
+                pass
+
+    return "unreachable"
+
+
+def check_smtp_login(smtp_server: str, smtp_port: int, smtp_user: str, smtp_password: str) -> str:
+    """
+    Check SMTP login details for the login page.
+    Returns "ok", "auth_failed" (login rejected), "unreachable" (server down / network error) or "error" (any other SMTP problem).
+    """
+    try:
+        with smtplib.SMTP(
+            host=smtp_server,
+            port=smtp_port,
+            timeout=SMTP_CONNECTION_TIMEOUT,
+            local_hostname=LOCAL_SMTP_HOST_NAME
+        ) as server:
+            server.starttls()
+            server.login(user=smtp_user, password=smtp_password)
+        return "ok"
+
+    except smtplib.SMTPAuthenticationError as e:
+        logging.warning(f"Login check: SMTP login rejected for user {smtp_user} on {smtp_server}:{smtp_port}: {e}")
+        return "auth_failed"
+
+    # Note: every smtplib error is also an OSError, so the SMTP errors are checked before the network errors
+    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected) as e:
+        logging.error(f"Login check: Could not connect to SMTP server {smtp_server}:{smtp_port} for user {smtp_user}: {e}")
+        return "unreachable"
+
+    except smtplib.SMTPResponseException as e:
+        # 421 = service not available right now
+        logging.error(f"Login check: SMTP error for user {smtp_user} on {smtp_server}:{smtp_port}: {e}")
+        return "unreachable" if e.smtp_code == 421 else "error"
+
+    except smtplib.SMTPException as e:
+        logging.error(f"Login check: SMTP error for user {smtp_user} on {smtp_server}:{smtp_port}: {e}")
+        return "error"
+
+    except OSError as e:
+        logging.error(f"Login check: Could not connect to SMTP server {smtp_server}:{smtp_port} for user {smtp_user}: {e}")
+        return "unreachable"
+
+    except Exception as e:
+        logging.error(f"Login check: SMTP error for user {smtp_user} on {smtp_server}:{smtp_port}: {e}", exc_info=True)
+        return "error"
 
 
 async def get_current_user_session_details(request: Request, CacheDB: MemcachedDep) -> dict:

@@ -976,6 +976,110 @@ def delete_emails_permanently(connection: IMAP4_SSL, folder: str, email_ids: lis
         }
 
 
+# Folder names used for Trash / Spam when the server does not mark them with special-use flags (RFC 6154)
+TRASH_AND_JUNK_FOLDER_NAMES = {"trash", "deleted", "deleted items", "deleted messages", "bin", "junk", "spam", "junk e-mail", "junk email", "bulk mail"}
+
+
+def is_trash_or_junk_folder(connection: IMAP4_SSL, folder: str) -> Optional[bool]:
+    """
+    Check if a folder is a Trash or Spam/Junk folder - by its special-use flag (\\Trash, \\Junk),
+    or by its name if the server does not set these flags.
+    Returns None if the folder does not exist.
+    """
+    # LIST wildcards would match other folders
+    if "*" in folder or "%" in folder:
+        return False
+
+    resp_status, data = connection.list('""', _imap_quote(folder))
+    if resp_status != "OK" or not data or data[0] is None:
+        return None
+
+    entry = data[0].decode("utf-8", errors="replace") if isinstance(data[0], bytes) else str(data[0])
+    match = re.match(r'^\((?P<flags>.*?)\)\s+(?P<delimiter>NIL|"(?:[^"\\]|\\.)*")\s+', entry)
+    if not match:
+        return None
+
+    flags = {flag.lower() for flag in match.group("flags").split()}
+    if flags & {"\\trash", "\\junk"}:
+        return True
+
+    # By name only for top level folders (or directly under INBOX) - a user's own "Projects/Trash" is not the Trash
+    delimiter = match.group("delimiter").strip('"').replace("\\\\", "\\")
+    folder_parts = folder.split(delimiter) if delimiter and delimiter != "NIL" else [folder]
+    if len(folder_parts) == 2 and folder_parts[0].upper() == "INBOX":
+        folder_parts = folder_parts[1:]
+    return len(folder_parts) == 1 and folder_parts[0].strip().lower() in TRASH_AND_JUNK_FOLDER_NAMES
+
+
+def mark_folder_as_read(connection: IMAP4_SSL, folder: str) -> int:
+    """
+    Mark all unread emails in a folder as read.
+    Only the emails that are unread right now are marked (an email arriving at the same time stays unread).
+    Returns the number of emails marked as read.
+    """
+    select_status, _ = connection.select(mailbox=_imap_quote(folder), readonly=False)
+    if select_status != "OK":
+        raise All_Exceptions(
+            message=f"Folder not found: {folder}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    resp_status, data = connection.search(None, "UNSEEN")
+    if resp_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to search unread emails: {resp_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+    unread_ids = [int(email_id) for email_id in data[0].split()] if data and data[0] else []
+    if not unread_ids:
+        return 0
+
+    store_status, data = connection.store(compress_ranges(unread_ids), "+FLAGS.SILENT", "(\\Seen)")
+    if store_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to mark emails as read: {store_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+    return len(unread_ids)
+
+
+def empty_folder(connection: IMAP4_SSL, folder: str) -> int:
+    """
+    Permanently delete all emails in a folder (for emptying Trash / Spam).
+    The caller must check that the folder is a Trash / Spam folder (is_trash_or_junk_folder).
+    Returns the number of emails deleted.
+    """
+    select_status, data = connection.select(mailbox=_imap_quote(folder), readonly=False)
+    if select_status != "OK":
+        raise All_Exceptions(
+            message=f"Folder not found: {folder}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    email_count = int(data[0]) if data and data[0] else 0
+    if email_count == 0:
+        return 0
+
+    store_status, data = connection.store("1:*", "+FLAGS.SILENT", "(\\Deleted)")
+    if store_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to mark emails as deleted: {store_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+    expunge_status, data = connection.expunge()
+    if expunge_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to delete emails: {expunge_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+    # EXPUNGE returns one id per deleted email
+    return len([email_id for email_id in data if email_id]) if data and data != [None] else email_count
+
+
 def _build_search_criteria(query: dict) -> str:
     """
     Returns a single valid IMAP search criteria string (parenthesized).
