@@ -24,8 +24,8 @@ from src.utils.base.libraries import (
     status,
     re
 )
-from src.imap import get_imap_connection_from_user_data, list_folders, parse_acl_response, parse_imap_response, parse_quota_response
-from src.utils.models import SetAclForm
+from src.imap import get_imap_connection_from_user_data, list_folders, parse_acl_response, parse_imap_response, parse_quota_response, mark_folder_as_read, is_trash_or_junk_folder, empty_folder
+from src.utils.models import SetAclForm, All_Exceptions
 from src.main import CurrentUser
 
 
@@ -322,3 +322,66 @@ def get_uid_validity(folder_path: str, user: CurrentUser) -> JSONResponse:
         },
         status_code=status.HTTP_200_OK
     )
+
+
+# Mark all emails in a folder as read
+@router.put("/mark-read", response_class=JSONResponse, tags=["Folder"], summary="Mark all emails in a folder as read")
+def mark_whole_folder_as_read(folder_path: str, user: CurrentUser) -> JSONResponse:
+    """Mark all unread emails in a folder as read (one IMAP command, works for any folder size)"""
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        marked_count = mark_folder_as_read(connection=imap_connection, folder=folder_path)
+        return JSONResponse(
+            content={
+                "message": "All emails marked as read" if marked_count else "No unread emails in the folder",
+                "folder_path": folder_path,
+                "marked_count": marked_count
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to mark emails as read: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
+# Empty a Trash or Spam folder
+@router.delete("/empty", response_class=JSONResponse, tags=["Folder"], summary="Permanently delete all emails in a Trash or Spam folder")
+def empty_trash_or_spam_folder(folder_path: str, user: CurrentUser) -> JSONResponse:
+    """
+    Permanently delete all emails in a Trash or Spam/Junk folder.
+    Only allowed for Trash / Spam folders (by the server's special-use flag or the folder name), to protect other folders.
+    """
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        is_allowed = is_trash_or_junk_folder(connection=imap_connection, folder=folder_path)
+        if is_allowed is None:
+            raise All_Exceptions(message=f"Folder not found: {folder_path}", status_code=status.HTTP_404_NOT_FOUND)
+        if not is_allowed:
+            raise All_Exceptions(message="Only the Trash and Spam folders can be emptied", status_code=status.HTTP_400_BAD_REQUEST)
+
+        deleted_count = empty_folder(connection=imap_connection, folder=folder_path)
+        return JSONResponse(
+            content={
+                "message": "Folder emptied" if deleted_count else "The folder is already empty",
+                "folder_path": folder_path,
+                "deleted_count": deleted_count
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to empty the folder: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
