@@ -35,11 +35,11 @@ from .routers import *
 app = FastAPI(
     title="Yukthi WebMail - API",
     description="This is the API for Yukthi WebMail",
-    version="2.2.5",
-    # docs_url=None,
-    # redoc_url=None,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    version="2.2.6",
+    docs_url=None,
+    redoc_url=None,
+    # docs_url="/docs",
+    # redoc_url="/redoc",
     include_in_schema=True,
     lifespan=lifespan
 )
