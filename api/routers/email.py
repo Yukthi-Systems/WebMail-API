@@ -19,7 +19,9 @@ This module provides E-Mail Box related API endpoints
 
 
 from src.utils.base.libraries import (
+    language_tool_python,
     PlainTextResponse,
+    language_tool,
     JSONResponse,
     UploadFile,
     APIRouter,
@@ -801,6 +803,46 @@ def fetch_email_details_by_message_ids(folder_path: str, message_ids: list[str],
     except Exception as e:
         return JSONResponse(
             content={"message": f"Failed to fetch email details: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
+# Do spell and grammar check by using LanguageTool
+@router.post("/check-spell-grammar", response_class=JSONResponse, tags=["E-Mail"], summary="Check spell and grammar using LanguageTool")
+def check_spell_and_grammar(data: dict, user: CurrentUser) -> JSONResponse:
+    """
+    Check spell and grammar using LanguageTool
+    """
+    text = data.get("text")
+    if not text:
+        return JSONResponse(
+            content={"message": "No text provided for spell and grammar check"},
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        # Perform spell and grammar check using LanguageTool
+        matches = language_tool.check(text=text)
+
+        # Store the matches in the corrections list
+        corrections = [match.__dict__ for match in matches]
+
+        # Correct the text using the matches found
+        corrected = language_tool_python.utils.correct(text=text, matches=matches)
+        
+        return JSONResponse(
+            content={
+                "original": text,
+                "corrected": corrected,
+                "matches": corrections,
+                "match_count": len(matches),
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to check spell and grammar: {str(e)}"},
             status_code=status.HTTP_424_FAILED_DEPENDENCY
         )
 

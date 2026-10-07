@@ -53,13 +53,13 @@ import asyncpg
 
 
 # other libraries
+from urllib.parse import quote as url_quote
 from datetime import datetime, timezone
 from deprecated import deprecated
 from threading import Thread
 from functools import wraps
 import calendar
 import base64
-from urllib.parse import quote as url_quote
 import orjson
 import time
 import pika
@@ -68,9 +68,13 @@ import uuid
 import re
 import os
 
-
 # Configure logging 
 from src.utils.base.constants import LOG_LEVEL, LOG_FILE_PATH
 from src.utils.base.log_utils import configure_return_logger
 
 logging = configure_return_logger(LOG_LEVEL=LOG_LEVEL, LOG_FILE_PATH=LOG_FILE_PATH)
+
+# Language tool library
+import language_tool_python
+
+language_tool = language_tool_python.LanguageTool('en-US')

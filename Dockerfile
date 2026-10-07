@@ -17,7 +17,7 @@ ENV NUMBER_OF_LOGS_TO_DISPLAY 100
 RUN apt-get update
 
 # Install essential packages
-RUN apt-get install -y gcc python3.11-dev
+RUN apt-get install -y gcc python3.11-dev default-jre
 
 # Copy requirements files to do pip install
 COPY requirements.txt .
