@@ -34,7 +34,10 @@ from pydantic import BaseModel, Field
 from sievelib.factory import FiltersSet as SieveFiltersSet
 from sievelib.managesieve import Client as SieveClient
 from sievelib import parser as SieveParser
+import imaplib
 from imaplib import IMAP4_SSL
+# imaplib rejects a response line over 1 MB, the SORT / SEARCH result of a folder with ~150k+ emails is one line
+imaplib._MAXLINE = 20_000_000
 from imapclient.response_parser import parse_fetch_response
 from imapclient.response_types import BodyData
 import smtplib
