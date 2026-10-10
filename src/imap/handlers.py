@@ -407,6 +407,24 @@ def get_sorted_email_ids(connection: IMAP4_SSL, folder_path: str, sort_by: str, 
     return email_ids[::-1] if sort_order == "desc" else email_ids
 
 
+def _fill_missing_date(headers: dict, internal_date) -> dict:
+    """
+    Some senders do not add a Date header (e.g. CERSAI system mails).
+    Use the IMAP INTERNALDATE (time the server received the email) in that case, like Roundcube does.
+    internal_date can be a datetime or the raw INTERNALDATE string ("03-Oct-2026 15:30:42 +0530").
+    """
+    if any(key.lower() == "date" and str(value).strip() for key, value in headers.items()):
+        return headers
+    try:
+        if isinstance(internal_date, (bytes, str)):
+            internal_date = datetime.strptime(_bs_str(internal_date).strip(), "%d-%b-%Y %H:%M:%S %z")
+        if isinstance(internal_date, datetime):
+            headers["Date"] = email.utils.format_datetime(internal_date)
+    except (ValueError, TypeError) as e:
+        logging.warning(f"Failed to parse INTERNALDATE {internal_date!r}: {e}")
+    return headers
+
+
 def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, full_headers: bool) -> list[dict]:
     """
     Get headers and flags of specific emails in a range.
@@ -416,7 +434,7 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
     connection.select(folder_path)
 
     # Request both headers and flags for a range of emails
-    query_string = '(FLAGS BODY.PEEK[HEADER])' if full_headers else '(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])'
+    query_string = '(FLAGS INTERNALDATE BODY.PEEK[HEADER])' if full_headers else '(FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])'
     resp_status, data = connection.fetch(id_range, query_string)
 
     if resp_status == "OK":
@@ -442,6 +460,10 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
 
                     # Clean up header values by doing basic decoding (e.g., for encoded words)
                     email_details = email_headers_cleanup(headers=email_details)
+
+                    # Fall back to the arrival time if the email has no Date header
+                    internal_date = re.search(r'INTERNALDATE "([^"]+)"', response_part[0].decode())
+                    email_details = _fill_missing_date(email_details, internal_date.group(1) if internal_date else None)
                     emails.append(email_details)
                 except Exception as e:
                     # One malformed message shouldn't fail the whole batch fetch
@@ -602,7 +624,7 @@ def _decode_part_text(content: bytes, charset: str) -> str:
 
 def _fetch_email_structure(connection: IMAP4_SSL, email_id: str, with_headers: bool) -> dict:
     """FETCH the flags, BODYSTRUCTURE and (optionally) the headers of a single email"""
-    query_string = "(FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])" if with_headers else "(BODYSTRUCTURE)"
+    query_string = "(FLAGS INTERNALDATE BODYSTRUCTURE BODY.PEEK[HEADER])" if with_headers else "(BODYSTRUCTURE)"
     try:
         resp_status, data = connection.fetch(email_id, query_string)
     except connection.error as e:
@@ -669,6 +691,7 @@ def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_re
     # Same header cleanup as the email listing
     email_message = email.message_from_bytes(fetch_data.get(b"BODY[HEADER]") or b"")
     headers = email_headers_cleanup(headers=dict(email_message._headers))
+    headers = _fill_missing_date(headers, fetch_data.get(b"INTERNALDATE"))
 
     flags = [_bs_str(flag) for flag in fetch_data.get(b"FLAGS", ())]
     if mark_as_read and "\\Seen" not in flags:
