@@ -22,7 +22,8 @@ from src.utils.base.libraries import (
     JSONResponse,
     APIRouter,
     status,
-    re
+    re,
+    logging
 )
 from src.imap import get_imap_connection_from_user_data, list_folders, parse_acl_response, parse_imap_response, parse_quota_response, mark_folder_as_read, is_trash_or_junk_folder, empty_folder
 from src.utils.models import SetAclForm, All_Exceptions
@@ -270,7 +271,16 @@ def get_user_quota(user: CurrentUser, folder_path: str = None) -> JSONResponse:
     # Get the quota
     try:
         if folder_path:
-            folder_quota = imap_connection.getquotaroot(folder_path)[1][1][0].decode()
+            typ, (quota_roots, quota_lines) = imap_connection.getquotaroot(folder_path)
+
+            # (no quota set, or its quota backend failed), imaplib then gives [None]
+            folder_quota = next((line.decode() for line in quota_lines if isinstance(line, bytes) and b"STORAGE" in line.upper()), None)
+            if typ != "OK" or folder_quota is None:
+                logging.warning(f"No storage quota from IMAP server for {user['user_email']} folder {folder_path}: {typ} roots={quota_roots} quota={quota_lines}")
+                return JSONResponse(
+                    content={"message": "Quota is not available from the mail server right now"},
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+                )
             quota = parse_quota_response(folder_quota)
         else:
             # TODO: Fix it
