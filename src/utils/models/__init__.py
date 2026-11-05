@@ -19,7 +19,7 @@ All the models used in the API are defined here
 
 
 from .generic import All_Exceptions, Error
-from .query_forms import AuthRequest, SetAclForm, Contact, SendMailForm, SearchMail, EmailTemplate, SieveFilters
+from .query_forms import AuthRequest, SetAclForm, Contact, SendMailForm, SearchMail, BulkEmailAction, EmailTemplate, SieveFilters
 
 
 __version__ = "v1.5.0-phoenix-release"
@@ -34,6 +34,7 @@ __annotations__ = {
     "Contact": "Contact form for the endpoint",
     "SendMailForm": "Send mail form for the endpoint",
     "SearchMail": "Search mail form for the endpoint",
+    "BulkEmailAction": "Form for an action on all emails of a folder, filter or search",
     "EmailTemplate": "Email template form for the endpoint",
     "SieveFilters": "Sieve filter representation model"
 }
@@ -47,6 +48,7 @@ __all__ = [
     "Contact",
     "SendMailForm",
     "SearchMail",
+    "BulkEmailAction",
     "EmailTemplate",
     "SieveFilters"
 ]

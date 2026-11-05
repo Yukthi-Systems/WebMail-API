@@ -229,6 +229,20 @@ class SearchMail(BaseModel):
         }
 
 
+class BulkEmailAction(BaseModel):
+    """Form for an action on all emails of a folder, filter or search"""
+    folder_path: str = Field(..., title="Folder", description="Folder of the emails")
+    action: Literal["read", "unread", "flag", "unflag", "move", "delete"] = Field(..., title="Action", description="delete is permanent and only allowed in a Trash or Spam folder, elsewhere move to Trash")
+    max_uid: int = Field(..., title="Max UID", description="UIDNEXT - 1 when the user selected all, newer emails are not touched")
+    uid_validity: str = Field(..., title="UIDVALIDITY", description="UIDVALIDITY when the user selected all, the request is refused if it changed")
+    dest_folder: Optional[str] = Field(None, title="Destination", description="Destination folder, required for move")
+    exclude_uids: list[int] = Field(default_factory=list, title="Excluded UIDs", description="Emails the user unselected")
+    filter_by: Literal["all", "unread", "read", "flagged", "unflagged"] = Field("all", title="Filter", description="The filter of the list the user selected from")
+    search: Optional[SearchMail] = Field(None, title="Search", description="The search the user selected from (only its criteria are used)")
+    conversations: bool = Field(True, title="Conversations", description="True: filter and search choose whole conversations, like /email/threads. False: single emails, like /email/fetch")
+    algorithm: Literal["refs", "references"] = Field("refs", title="Algorithm", description="Same as /email/threads")
+
+
 class EmailTemplate(BaseModel):
     """Email template form for the endpoint"""
     name: str = Field(..., title="Template Name", description="Name of the email template")

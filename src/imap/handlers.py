@@ -19,7 +19,7 @@ list folders, and fetch emails from a specific folder.
 # <https://www.gnu.org/licenses/>.
 
 
-from src.utils.base.libraries import logging, IMAP4_SSL, parse_fetch_response, BodyData, email, status, re, datetime, calendar, base64, quopri, Optional
+from src.utils.base.libraries import logging, IMAP4_SSL, parse_fetch_response, BodyData, email, status, re, datetime, timezone, calendar, base64, quopri, time, Optional
 from src.utils.models import All_Exceptions, SearchMail
 
 
@@ -48,6 +48,44 @@ def compress_ranges(nums: list[int]) -> str:
     ranges.append(f"{start}:{prev}" if start != prev else str(start))
 
     return ",".join(ranges)
+
+
+def _imap_command(connection: IMAP4_SSL, use_uid: bool, command: str, *args):
+    """
+    Run an IMAP command (FETCH, STORE, COPY, MOVE) on email ids.
+    use_uid=True: the ids are UIDs (UID FETCH / UID STORE ...) - a UID never changes when other emails are deleted or moved.
+    use_uid=False: the ids are sequence numbers (old behaviour).
+    """
+    if use_uid:
+        return connection.uid(command, *args)
+    return getattr(connection, command.lower())(*args)
+
+
+def _server_capabilities(connection: IMAP4_SSL) -> set[str]:
+    """
+    Capabilities of the IMAP server after login (e.g. MOVE, UIDPLUS, THREAD=REFERENCES).
+    imaplib only keeps the capabilities sent before login, so ask the server again (once per connection).
+    """
+    if getattr(connection, "_post_login_capabilities", None) is None:
+        capabilities = set()
+        try:
+            resp_status, data = connection.capability()
+            if resp_status == "OK" and data and data[0]:
+                capabilities = {capability.upper() for capability in data[0].decode(errors="ignore").split()}
+        except Exception as e:
+            logging.warning(f"Failed to get IMAP capabilities: {e}")
+        connection._post_login_capabilities = capabilities
+    return connection._post_login_capabilities
+
+
+def _expunge_uids(connection: IMAP4_SSL, uids: list) -> tuple:
+    """
+    Expunge only the given UIDs (UID EXPUNGE - RFC 4315 UIDPLUS), so other emails marked as deleted are not touched.
+    Falls back to a plain EXPUNGE if the server does not support UIDPLUS.
+    """
+    if uids and "UIDPLUS" in _server_capabilities(connection):
+        return connection.uid("EXPUNGE", compress_ranges([int(uid) for uid in uids]))
+    return connection.expunge()
 
 
 def list_folders(connection: IMAP4_SSL) -> list[dict]:
@@ -331,20 +369,20 @@ def _part_has_attachment(part, parent_sub_type: str = "") -> bool:
     return has_file_name and disposition_type != "inline"
 
 
-def get_attachment_status(connection: IMAP4_SSL, id_range: str) -> dict[str, bool]:
+def get_attachment_status(connection: IMAP4_SSL, id_range: str, use_uid: bool = False) -> dict[str, bool]:
     """
     Get the attachment status of emails in a range using BODYSTRUCTURE (no message body is downloaded).
-    Returns a dictionary with email ids as keys and True/False as values.
+    Returns a dictionary with email ids (UIDs if use_uid) as keys and True/False as values.
     Never raises - on any failure it returns what it could parse (missing ids are treated as no attachment).
     """
     attachment_status = {}
     try:
-        resp_status, data = connection.fetch(id_range, '(BODYSTRUCTURE)')
+        resp_status, data = _imap_command(connection, use_uid, "FETCH", id_range, '(UID BODYSTRUCTURE)' if use_uid else '(BODYSTRUCTURE)')
         if resp_status != "OK":
             logging.error(f"Failed to fetch BODYSTRUCTURE for range {id_range}: {resp_status}")
             return attachment_status
 
-        for email_id, fetch_data in parse_fetch_response(data, normalise_times=False, uid_is_key=False).items():
+        for email_id, fetch_data in parse_fetch_response(data, normalise_times=False, uid_is_key=use_uid).items():
             try:
                 attachment_status[str(email_id)] = _part_has_attachment(BodyData.create(fetch_data[b'BODYSTRUCTURE']))
             except Exception as e:
@@ -407,6 +445,596 @@ def get_sorted_email_ids(connection: IMAP4_SSL, folder_path: str, sort_by: str, 
     return email_ids[::-1] if sort_order == "desc" else email_ids
 
 
+# Threading algorithms of the IMAP THREAD command
+#   refs (default): References / In-Reply-To headers only - emails sharing only a subject stay separate
+#   references: RFC 5256 - the same headers, and also groups emails by subject (unrelated emails with a short subject like "test" get merged)
+THREAD_ALGORITHMS = {
+    "references": "REFERENCES",
+    "refs": "REFS"
+}
+
+THREAD_FILTER_KEYS = {
+    "unread": ("UNSEEN", True),     # Threads with at least one unread email
+    "read": ("UNSEEN", False),      # Threads with no unread email
+    "flagged": ("FLAGGED", True),   # Threads with at least one flagged email
+    "unflagged": ("FLAGGED", False) # Threads with no flagged email
+}
+
+
+def _parse_thread_response(data: list) -> list[list[str]]:
+    """
+    Parse an IMAP THREAD response (RFC 5256) into a list of threads, each a flat list of email ids.
+    Example: b'(2)(3 6 (4 23)(44 7 96))' -> [['2'], ['3', '6', '4', '23', '44', '7', '96']]
+    Not recursive - a deep thread (long reply chain) can not hit the recursion limit.
+    """
+    raw = b" ".join(part for part in data if isinstance(part, bytes)).decode(errors="ignore")
+
+    threads, current_thread, current_number, depth = [], [], "", 0
+    for char in raw:
+        if char.isdigit():
+            current_number += char
+            continue
+
+        if current_number:
+            current_thread.append(current_number)
+            current_number = ""
+
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(depth - 1, 0)
+            if depth == 0 and current_thread:
+                threads.append(current_thread)
+                current_thread = []
+
+    if current_number:
+        current_thread.append(current_number)
+    if current_thread:
+        threads.append(current_thread)
+
+    return threads
+
+
+def _uid_search(connection: IMAP4_SSL, search_criteria: str) -> list[str]:
+    """UID SEARCH in the selected folder, returns the UIDs"""
+    resp_status, data = connection.uid("SEARCH", search_criteria)
+    if resp_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to search emails: {resp_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+    return data[0].decode().split() if data and data[0] else []
+
+
+def _thread_by_headers(connection: IMAP4_SSL) -> list[list[str]]:
+    """
+    Group the emails of the selected folder by their Message-ID / In-Reply-To / References headers.
+    Only used when the IMAP server does not support THREAD. Emails sharing any Message-ID end up in one thread.
+    Returns the threads as lists of UIDs.
+    """
+    resp_status, data = connection.uid("FETCH", "1:*", "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)])")
+    if resp_status != "OK":
+        raise All_Exceptions(
+            message=f"Failed to fetch email headers: {resp_status}; {str(data)}",
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+    parent = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    uids = []
+    for uid, fetch_data in parse_fetch_response(data, normalise_times=False, uid_is_key=True).items():
+        uid = str(uid)
+        uids.append(uid)
+        header_bytes = next((value for key, value in fetch_data.items() if isinstance(key, bytes) and key.startswith(b"BODY[")), b"") or b""
+        headers = email.message_from_bytes(header_bytes)
+        referenced_ids = re.findall(r"<[^<>\s]+>", " ".join(str(headers.get(name, "")) for name in ("Message-ID", "In-Reply-To", "References")))
+
+        node = find(f"uid:{uid}")
+        for message_id in referenced_ids:
+            message_root = find(message_id.lower())
+            if message_root != node:
+                parent[message_root] = node
+
+    threads = {}
+    for uid in uids:
+        threads.setdefault(find(f"uid:{uid}"), []).append(uid)
+    return list(threads.values())
+
+
+def _get_folder_threads(connection: IMAP4_SSL, folder_path: str, algorithm: str) -> dict:
+    """
+    Group all emails of a folder into conversations (threads) on the IMAP server - UID THREAD (RFC 5256).
+    Uses the requested algorithm, then the other one, then (server without THREAD) the Message-ID headers.
+    Returns:
+        threads: list of threads, each a list of UIDs sorted by date (oldest first)
+        date_position: position of every UID by its Date header (higher = newer)
+        total_messages: number of emails in the folder
+        uid_validity: UIDVALIDITY of the folder (if it changes, all UIDs the client has are invalid)
+        algorithm: the algorithm that was used
+    """
+    resp_status, data = connection.select(mailbox=_quoted_folder(folder_path), readonly=True)
+    if resp_status != "OK":
+        raise All_Exceptions(
+            message=f"Folder not found: {folder_path}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+    total_messages = int(data[0]) if data and data[0] else 0
+    _, uid_validity = connection.response("UIDVALIDITY")
+    uid_validity = uid_validity[0].decode() if uid_validity and isinstance(uid_validity[0], bytes) else None
+
+    result = {"threads": [], "date_position": {}, "total_messages": total_messages, "uid_validity": uid_validity, "algorithm": None}
+    if total_messages == 0:
+        return result
+
+    # Position of every email by its Date header (same ordering as sort_by=date in the email listing)
+    date_position = {}
+    try:
+        resp_status, data = connection.uid("SORT", "(DATE)", "UTF-8", "ALL")
+        if resp_status == "OK" and data and data[0]:
+            date_position = {uid: position for position, uid in enumerate(data[0].decode().split())}
+        else:
+            logging.error(f"IMAP SORT failed for folder {folder_path}: {resp_status}; {data}")
+    except Exception as e:
+        logging.warning(f"IMAP SORT not available for folder {folder_path}, using arrival order for threads: {e}")
+
+    threads = None
+    for algorithm_name in [algorithm] + [name for name in THREAD_ALGORITHMS if name != algorithm]:
+        try:
+            resp_status, data = connection.uid("THREAD", THREAD_ALGORITHMS[algorithm_name], "UTF-8", "ALL")
+            if resp_status == "OK":
+                threads = _parse_thread_response(data)
+                result["algorithm"] = algorithm_name
+                break
+            logging.warning(f"IMAP THREAD {algorithm_name} failed for folder {folder_path}: {resp_status}; {data}")
+        except Exception as e:
+            logging.warning(f"IMAP THREAD {algorithm_name} not available for folder {folder_path}: {e}")
+
+    if threads is None:
+        threads = _thread_by_headers(connection=connection)
+        result["algorithm"] = "headers"
+
+    # An email that arrived after the SORT (not in date_position) is the newest
+    newest_position = len(date_position)
+
+    def _position(uid: str) -> int:
+        return date_position[uid] if uid in date_position else newest_position + int(uid)
+
+    result["threads"] = [sorted(thread, key=_position) for thread in threads if thread]
+    result["date_position"] = {uid: _position(uid) for thread in result["threads"] for uid in thread}
+    return result
+
+
+# Headers fetched for the emails of a thread (to find the related emails in the Sent folder)
+THREAD_HEADER_FIELDS = ("MESSAGE-ID", "IN-REPLY-TO", "REFERENCES")
+
+# Sent folder names used when the server does not mark it with the \Sent special-use flag (RFC 6154)
+# Matched at the top level or directly under INBOX ("Sent", "INBOX/Sent", "INBOX.Sent Items"), not inside other folders
+SENT_FOLDER_NAMES = ("sent", "sent items", "sent messages", "sent mail")
+
+
+def _list_folder_entries(connection: IMAP4_SSL) -> list[tuple[set[str], Optional[str], str]]:
+    """LIST all folders, returns (flags in lower case, delimiter, folder name) for each"""
+    resp_status, data = connection.list()
+    if resp_status != "OK" or not data:
+        return []
+
+    pattern = re.compile(r'^\((?P<flags>.*?)\)\s+(?P<delimiter>NIL|"(?:[^"\\]|\\.)*")\s+(?P<name>.*)$')
+    entries = []
+    for item in data:
+        literal_name = None
+        if isinstance(item, tuple):     # Folder name sent as a literal
+            line, literal_name = item[0], item[1]
+        elif isinstance(item, bytes):
+            line = item
+        else:
+            continue
+
+        match = pattern.match(line.decode("utf-8", errors="replace"))
+        if not match:
+            continue
+
+        if literal_name is not None:
+            name = literal_name.decode("utf-8", errors="replace")
+        else:
+            name = match.group("name").strip()
+            if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+                name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+
+        delimiter = match.group("delimiter")
+        delimiter = None if delimiter == "NIL" else delimiter[1:-1].replace("\\\\", "\\")
+        entries.append(({flag.lower() for flag in match.group("flags").split()}, delimiter, name))
+
+    return entries
+
+
+def _sent_name_rank(name: str, delimiter: Optional[str]) -> Optional[int]:
+    """Position of a folder in SENT_FOLDER_NAMES, ignoring an INBOX parent. None if it is not a Sent folder name."""
+    parts = name.split(delimiter) if delimiter else [name]
+    if len(parts) == 2 and parts[0].upper() == "INBOX":
+        parts = parts[1:]
+    if len(parts) != 1:
+        return None     # A user's own "Projects/Sent" is not the Sent folder
+    base_name = parts[0].strip().lower()
+    return SENT_FOLDER_NAMES.index(base_name) if base_name in SENT_FOLDER_NAMES else None
+
+
+def _folder_message_count(connection: IMAP4_SSL, folder: str) -> int:
+    """Number of emails in a folder (STATUS, the folder is not selected), -1 if it can not be read"""
+    try:
+        resp_status, data = connection.status(_quoted_folder(folder), "(MESSAGES)")
+        match = re.search(rb"MESSAGES\s+(\d+)", data[0]) if resp_status == "OK" and data and isinstance(data[0], bytes) else None
+        return int(match.group(1)) if match else -1
+    except Exception as e:
+        logging.warning(f"Failed to get the number of emails of folder {folder}: {e}")
+        return -1
+
+
+def find_sent_folder(connection: IMAP4_SSL) -> Optional[str]:
+    """
+    Find the Sent folder - by its special-use flag (\\Sent) and by its name (also directly under INBOX, e.g. "INBOX/Sent").
+    The flag alone can not be trusted: a mailbox can have an empty "Sent Messages" with the flag, while the emails
+    are saved in "Sent". With more than one candidate, the one with the most emails is used (the flagged one on a tie).
+    Returns None if there is no Sent folder.
+    """
+    entries = [entry for entry in _list_folder_entries(connection) if not entry[0] & {"\\noselect", "\\nonexistent"}]
+
+    named = [(_sent_name_rank(name, delimiter), name) for _, delimiter, name in entries]
+    candidates = [name for flags, _, name in entries if "\\sent" in flags]
+    candidates += [name for rank, name in sorted((item for item in named if item[0] is not None), key=lambda item: item[0])]
+    candidates = list(dict.fromkeys(candidates))
+
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+
+    # max() keeps the first candidate on a tie, the flagged folders are first
+    return max(candidates, key=lambda folder: _folder_message_count(connection, folder))
+
+
+def _header_value(email_details: dict, header_name: str) -> str:
+    """Value of a header (case-insensitive name) of an email of get_email_details"""
+    header_name = header_name.lower()
+    return next((str(value) for key, value in email_details.items() if isinstance(key, str) and key.lower() == header_name), "")
+
+
+def _header_message_ids(value: str) -> list[str]:
+    """Message-IDs in a header value, in lower case (Message-IDs are compared case-insensitive, like the IMAP search)"""
+    return [message_id.lower() for message_id in re.findall(r"<[^<>\s]+>", value)]
+
+
+def _own_message_id(email_details: dict) -> Optional[str]:
+    message_ids = _header_message_ids(_header_value(email_details, "Message-ID"))
+    return message_ids[0] if message_ids else None
+
+
+def _referenced_message_ids(email_details: dict) -> set[str]:
+    return set(_header_message_ids(_header_value(email_details, "In-Reply-To") + " " + _header_value(email_details, "References")))
+
+
+def _email_datetime(email_details: dict) -> Optional[datetime]:
+    """Date header as an aware datetime (UTC if the header has no timezone), None if it can not be parsed"""
+    try:
+        email_datetime = email.utils.parsedate_to_datetime(_header_value(email_details, "Date"))
+        return email_datetime if email_datetime.tzinfo else email_datetime.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _merge_by_date(folder_emails: list[dict], other_emails: list[dict]) -> list[dict]:
+    """
+    Insert other_emails into folder_emails (already in date order) by their Date header.
+    The order of folder_emails is kept as it is (it comes from the IMAP server SORT).
+    """
+    merged = list(folder_emails)
+    for other_email in sorted(other_emails, key=lambda other: (_email_datetime(other) is None, _email_datetime(other) or datetime.min.replace(tzinfo=timezone.utc))):
+        other_datetime = _email_datetime(other_email)
+        position = len(merged)
+        if other_datetime is not None:
+            for index, merged_email in enumerate(merged):
+                merged_datetime = _email_datetime(merged_email)
+                if merged_datetime is not None and merged_datetime > other_datetime:
+                    position = index
+                    break
+        merged.insert(position, other_email)
+    return merged
+
+
+def _quoted_folder(folder: str) -> str:
+    """Folder name quoted for SELECT (a name from LIST can have spaces, e.g. "Sent Items") - kept as it is if already quoted"""
+    return folder if len(folder) >= 2 and folder.startswith('"') and folder.endswith('"') else _imap_quote(folder)
+
+
+def _search_any(connection: IMAP4_SSL, search_terms: list[str], chunk_size: int = 60) -> set[str]:
+    """UID SEARCH for emails matching any of the search terms (OR), in chunks so a command never gets too long"""
+    uids = set()
+    for start in range(0, len(search_terms), chunk_size):
+        chunk = search_terms[start:start + chunk_size]
+        search_query = chunk[-1]
+        for search_term in reversed(chunk[:-1]):
+            search_query = f"OR {search_term} {search_query}"
+        uids.update(_uid_search(connection=connection, search_criteria=f"({search_query})"))
+    return uids
+
+
+def _find_sent_emails(connection: IMAP4_SSL, threads_emails: list[list[dict]], sent_folder: str, full_headers: bool) -> list[list[dict]]:
+    """
+    Find the emails of the Sent folder that belong to each thread (your own replies).
+    An email of the Sent folder belongs to a thread if:
+        - an email of the thread replies to it (its Message-ID is in the In-Reply-To / References of the thread), or
+        - it replies to an email of the thread (its In-Reply-To / References has a Message-ID of the thread)
+    Emails that are in both folders (e.g. sent with yourself in Cc) are not added twice.
+    threads_emails: the emails (get_email_details with THREAD_HEADER_FIELDS) of each thread
+    Returns the Sent emails of each thread (same order as threads_emails), each with folder_path.
+    """
+    own_ids_per_thread = [{message_id for message_id in map(_own_message_id, thread_emails) if message_id} for thread_emails in threads_emails]
+    referenced_ids_per_thread = [set().union(*map(_referenced_message_ids, thread_emails)) for thread_emails in threads_emails]
+    all_own_ids = set().union(*own_ids_per_thread)
+    all_referenced_ids = set().union(*referenced_ids_per_thread) - all_own_ids
+
+    sent_emails_per_thread = [[] for _ in threads_emails]
+    search_terms = [f"HEADER Message-ID {_imap_quote(message_id)}" for message_id in sorted(all_referenced_ids)]
+    for message_id in sorted(all_own_ids):
+        search_terms.append(f"HEADER References {_imap_quote(message_id)}")
+        search_terms.append(f"HEADER In-Reply-To {_imap_quote(message_id)}")
+    if not search_terms:
+        return sent_emails_per_thread
+
+    resp_status, _ = connection.select(mailbox=_quoted_folder(sent_folder), readonly=True)
+    if resp_status != "OK":
+        logging.warning(f"Failed to select the Sent folder {sent_folder}: {resp_status}")
+        return sent_emails_per_thread
+
+    sent_uids = _search_any(connection=connection, search_terms=search_terms)
+    if not sent_uids:
+        return sent_emails_per_thread
+
+    sent_emails = get_email_details(
+        connection=connection,
+        id_range=compress_ranges([int(uid) for uid in sent_uids]),
+        folder_path=_quoted_folder(sent_folder),
+        full_headers=full_headers,
+        use_uid=True,
+        extra_header_fields=THREAD_HEADER_FIELDS
+    )
+
+    for sent_email in sent_emails:
+        sent_own_id = _own_message_id(sent_email)
+        if sent_own_id and sent_own_id in all_own_ids:
+            continue    # Already in the folder
+
+        sent_referenced_ids = _referenced_message_ids(sent_email)
+        for index, (own_ids, referenced_ids) in enumerate(zip(own_ids_per_thread, referenced_ids_per_thread)):
+            # IMAP HEADER search is a substring match - check the exact Message-IDs here
+            if (sent_own_id and sent_own_id in referenced_ids) or (sent_referenced_ids & own_ids):
+                sent_email["folder_path"] = sent_folder
+                sent_emails_per_thread[index].append(sent_email)
+                break
+
+    return sent_emails_per_thread
+
+
+def _resolve_sent_folder(connection: IMAP4_SSL, folder_path: str, include_sent: bool, sent_folder: Optional[str]) -> Optional[str]:
+    """
+    The Sent folder to add to the threads of folder_path - None if not wanted, not found, or folder_path is the Sent folder.
+    A given sent_folder that does not exist (e.g. the default "Sent" on a mailbox with "INBOX/Sent") falls back to find_sent_folder.
+    """
+    if not include_sent:
+        return None
+    try:
+        if sent_folder and _folder_message_count(connection, sent_folder) < 0:
+            logging.warning(f"Sent folder {sent_folder} not found, looking for the Sent folder of the mailbox")
+            sent_folder = None
+        sent_folder = sent_folder or find_sent_folder(connection)
+    except Exception as e:
+        logging.warning(f"Failed to find the Sent folder: {e}")
+        return None
+    if not sent_folder or sent_folder.strip('"').lower() == folder_path.strip('"').lower():
+        return None
+    return sent_folder
+
+
+def _add_sent_emails(connection: IMAP4_SSL, threads_emails: list[list[dict]], sent_folder: Optional[str], full_headers: bool) -> Optional[list[list[dict]]]:
+    """_find_sent_emails that never fails the request - the threads are still returned without the Sent emails"""
+    if not sent_folder:
+        return None
+    try:
+        return _find_sent_emails(connection=connection, threads_emails=threads_emails, sent_folder=sent_folder, full_headers=full_headers)
+    except Exception as e:
+        logging.error(f"Failed to add the emails of the Sent folder {sent_folder} to the threads: {e}", exc_info=True)
+        return [[] for _ in threads_emails]
+
+
+def _thread_summary(thread: list[str], email_details_by_uid: dict[str, dict], matched_uids: Optional[set] = None, sent_emails: Optional[list[dict]] = None, sent_folder: Optional[str] = None) -> Optional[dict]:
+    """
+    Build the summary of one thread (latest email + combined flags) from the details of its emails.
+    sent_emails: your replies from the Sent folder - they are counted in message_count, participants, flags and attachments.
+    id, thread_id, email_ids and latest are always the emails of the folder itself (the thread's position in the list).
+    """
+    thread_emails = [email_details_by_uid[uid] for uid in thread if uid in email_details_by_uid]
+    if not thread_emails:
+        return None
+
+    all_emails = _merge_by_date(thread_emails, sent_emails) if sent_emails else thread_emails
+
+    participants = []
+    for thread_email in all_emails:
+        sender = thread_email.get("From")
+        if sender and sender not in participants:
+            participants.append(sender)
+
+    unread_count = sum(1 for thread_email in all_emails if "\\Seen" not in thread_email.get("FLAGS", []))
+
+    summary = {
+        "id": thread_emails[-1]["id"],                  # UID of the latest email of the thread (in this folder)
+        "thread_id": thread_emails[0]["id"],            # UID of the oldest email of the thread (in this folder)
+        "email_ids": [thread_email["id"] for thread_email in thread_emails],     # UIDs in this folder, oldest first
+        "subject": all_emails[0].get("Subject"),        # Subject of the first email of the conversation
+        "message_count": len(all_emails),
+        "unread_count": unread_count,
+        "is_unread": unread_count > 0,
+        "is_flagged": any("\\Flagged" in thread_email.get("FLAGS", []) for thread_email in all_emails),
+        "has_attachment": any(thread_email.get("has_attachment", False) for thread_email in all_emails),
+        "participants": participants,
+        "latest": thread_emails[-1]
+    }
+    if matched_uids is not None:
+        summary["matched_email_ids"] = [thread_email["id"] for thread_email in thread_emails if thread_email["id"] in matched_uids]
+    if sent_folder:
+        sent_in_order = [thread_email for thread_email in all_emails if thread_email.get("folder_path") == sent_folder]
+        summary["folder_message_count"] = len(thread_emails)
+        summary["sent_count"] = len(sent_in_order)
+        summary["sent_folder_path"] = sent_folder
+        summary["sent_email_ids"] = [sent_email["id"] for sent_email in sent_in_order]     # UIDs in the Sent folder, oldest first
+        summary["last_message"] = all_emails[-1]       # Latest email of the whole conversation (can be your reply)
+    return summary
+
+
+def _filter_threads(connection: IMAP4_SSL, threads: list[list[str]], filter_by: str, search_criteria: Optional[str]) -> tuple[list[list[str]], Optional[set]]:
+    """
+    Keep the threads that pass filter_by and contain at least one email matching search_criteria.
+    Returns the threads and the UIDs that match the search (None without a search).
+    """
+    if filter_by != "all" and threads:
+        search_key, must_match = THREAD_FILTER_KEYS[filter_by]
+        matching_uids = set(_uid_search(connection=connection, search_criteria=search_key))
+        threads = [thread for thread in threads if any(uid in matching_uids for uid in thread) == must_match]
+
+    if search_criteria is None:
+        return threads, None
+    if not threads:
+        return threads, set()
+
+    matched_uids = set(_uid_search(connection=connection, search_criteria=search_criteria))
+    return [thread for thread in threads if any(uid in matched_uids for uid in thread)], matched_uids
+
+
+def get_thread_page(connection: IMAP4_SSL, folder_path: str, batch_size: int, page_number: int, sort_order: str, filter_by: str, full_headers: bool, algorithm: str = "refs", search_criteria: Optional[str] = None, include_sent: bool = False, sent_folder: Optional[str] = None) -> dict:
+    """
+    Get a page of conversations (threads) of a folder - one row per conversation.
+    All ids are UIDs. Threads are grouped across the whole folder and ordered by their latest email (Date header).
+    filter_by: unread / flagged = threads with at least one such email, read / unflagged = threads with none
+    search_criteria: IMAP search - only threads with at least one matching email (matched_email_ids lists them)
+    include_sent: add your replies from the Sent folder to each thread (sent_folder, or found by find_sent_folder)
+    """
+    folder_threads = _get_folder_threads(connection=connection, folder_path=folder_path, algorithm=algorithm)
+    date_position = folder_threads["date_position"]
+    threads, matched_uids = _filter_threads(connection=connection, threads=folder_threads["threads"], filter_by=filter_by, search_criteria=search_criteria)
+
+    # Order the threads by their latest email (UID breaks ties, the newer email first for desc)
+    threads.sort(key=lambda thread: (date_position[thread[-1]], int(thread[-1])), reverse=sort_order == "desc")
+
+    total_count = len(threads)
+    total_pages = total_count // batch_size + (total_count % batch_size > 0)
+    page_threads = threads[(page_number - 1) * batch_size: page_number * batch_size] if page_number >= 1 else []
+
+    sent_folder = _resolve_sent_folder(connection=connection, folder_path=folder_path, include_sent=include_sent, sent_folder=sent_folder) if page_threads else None
+
+    result = {
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "total_messages": sum(len(thread) for thread in threads),
+        "uid_validity": folder_threads["uid_validity"],
+        "algorithm": folder_threads["algorithm"],
+        "sent_folder_path": sent_folder,
+        "threads": []
+    }
+    if not page_threads:
+        return result
+
+    # Fetch only the emails of the threads on this page (one FETCH)
+    email_details = get_email_details(
+        connection=connection,
+        id_range=compress_ranges([int(uid) for thread in page_threads for uid in thread]),
+        folder_path=_quoted_folder(folder_path),
+        full_headers=full_headers,
+        use_uid=True,
+        extra_header_fields=THREAD_HEADER_FIELDS
+    )
+    email_details_by_uid = {email_detail["id"]: email_detail for email_detail in email_details}
+    if sent_folder:
+        for email_detail in email_details:
+            email_detail["folder_path"] = folder_path
+
+    # Your replies from the Sent folder (one SEARCH + one FETCH in the Sent folder)
+    sent_emails_per_thread = _add_sent_emails(
+        connection=connection,
+        threads_emails=[[email_details_by_uid[uid] for uid in thread if uid in email_details_by_uid] for thread in page_threads],
+        sent_folder=sent_folder,
+        full_headers=full_headers
+    )
+
+    for index, thread in enumerate(page_threads):
+        if thread_summary := _thread_summary(
+            thread=thread,
+            email_details_by_uid=email_details_by_uid,
+            matched_uids=matched_uids,
+            sent_emails=sent_emails_per_thread[index] if sent_emails_per_thread else None,
+            sent_folder=sent_folder
+        ):
+            result["threads"].append(thread_summary)
+
+    return result
+
+
+def get_thread_emails(connection: IMAP4_SSL, folder_path: str, email_uid: str, full_headers: bool, algorithm: str = "refs", include_sent: bool = False, sent_folder: Optional[str] = None) -> dict:
+    """
+    Get the conversation (thread) that contains the given email (UID): its summary and all its emails, oldest first.
+    include_sent: also your replies from the Sent folder, in date order (each email has folder_path)
+    """
+    folder_threads = _get_folder_threads(connection=connection, folder_path=folder_path, algorithm=algorithm)
+
+    thread = next((thread for thread in folder_threads["threads"] if email_uid in thread), None)
+    if thread is None:
+        raise All_Exceptions(
+            message=f"Email not found: {email_uid}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    email_details = get_email_details(
+        connection=connection,
+        id_range=compress_ranges([int(uid) for uid in thread]),
+        folder_path=_quoted_folder(folder_path),
+        full_headers=full_headers,
+        use_uid=True,
+        extra_header_fields=THREAD_HEADER_FIELDS
+    )
+    email_details_by_uid = {email_detail["id"]: email_detail for email_detail in email_details}
+    thread_emails = [email_details_by_uid[uid] for uid in thread if uid in email_details_by_uid]
+
+    sent_folder = _resolve_sent_folder(connection=connection, folder_path=folder_path, include_sent=include_sent, sent_folder=sent_folder)
+    if sent_folder:
+        for email_detail in email_details:
+            email_detail["folder_path"] = folder_path
+    sent_emails = _add_sent_emails(connection=connection, threads_emails=[thread_emails], sent_folder=sent_folder, full_headers=full_headers)
+
+    thread_summary = _thread_summary(
+        thread=thread,
+        email_details_by_uid=email_details_by_uid,
+        sent_emails=sent_emails[0] if sent_emails else None,
+        sent_folder=sent_folder
+    )
+    if thread_summary is None:
+        raise All_Exceptions(
+            message=f"Email not found: {email_uid}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    # Emails in date order (oldest first), with your replies from the Sent folder if include_sent
+    thread_summary["emails"] = _merge_by_date(thread_emails, sent_emails[0]) if sent_emails else thread_emails
+    thread_summary["uid_validity"] = folder_threads["uid_validity"]
+    thread_summary["algorithm"] = folder_threads["algorithm"]
+    thread_summary["sent_folder_path"] = sent_folder
+    return thread_summary
+
+
 def _fill_missing_date(headers: dict, internal_date) -> dict:
     """
     Some senders do not add a Date header (e.g. CERSAI system mails).
@@ -425,17 +1053,21 @@ def _fill_missing_date(headers: dict, internal_date) -> dict:
     return headers
 
 
-def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, full_headers: bool) -> list[dict]:
+def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, full_headers: bool, use_uid: bool = False, extra_header_fields: tuple = ()) -> list[dict]:
     """
     Get headers and flags of specific emails in a range.
     Returns a dictionary with email ids as keys and email headers and flags as values.
+    use_uid: id_range has UIDs and "id" of each email is its UID (default: sequence numbers, old behaviour).
+    Every email also has "uid" (its UID) - use it with use_uid=true on the other endpoints.
+    extra_header_fields: more headers to fetch when full_headers is false (e.g. ("MESSAGE-ID",)), default: none (old behaviour)
     """
     # Encode folder name to handle special characters
     connection.select(folder_path)
 
-    # Request both headers and flags for a range of emails
-    query_string = '(FLAGS INTERNALDATE BODY.PEEK[HEADER])' if full_headers else '(FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])'
-    resp_status, data = connection.fetch(id_range, query_string)
+    # Request both headers and flags for a range of emails (and the UID, it is returned as "uid")
+    header_fields = " ".join(("FROM", "TO", "SUBJECT", "DATE") + tuple(extra_header_fields))
+    query_string = '(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])' if full_headers else f'(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS ({header_fields})])'
+    resp_status, data = _imap_command(connection, use_uid, "FETCH", id_range, query_string)
 
     if resp_status == "OK":
         emails = []
@@ -446,7 +1078,13 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
                 try:
                     # Parse the email header
                     email_message = email.message_from_bytes(response_part[1])
+                    uid_match = re.search(r'\bUID (\d+)', response_part[0].decode())
+                    email_uid = uid_match.group(1) if uid_match else None
                     email_id = response_part[0].decode().split()[0]  # Extract email ID from response
+                    if use_uid:
+                        if email_uid is None:
+                            raise ValueError(f"UID missing in FETCH response: {response_part[0]!r}")
+                        email_id = email_uid
 
                     # Extract flags from the same response part
                     flags = []
@@ -457,6 +1095,7 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
                     email_details = dict(email_message._headers)
                     email_details['FLAGS'] = flags  # Add the flags as a new key-value pair
                     email_details['id'] = email_id  # Add the email ID to the details
+                    email_details['uid'] = email_uid  # UID of the email (does not change when other emails are deleted / moved)
 
                     # Clean up header values by doing basic decoding (e.g., for encoded words)
                     email_details = email_headers_cleanup(headers=email_details)
@@ -476,7 +1115,7 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
             )
 
         # Add attachment status (separate FETCH so the header parsing above is not affected)
-        attachment_status = get_attachment_status(connection=connection, id_range=id_range)
+        attachment_status = get_attachment_status(connection=connection, id_range=id_range, use_uid=use_uid)
         for email_details in emails:
             email_details['has_attachment'] = attachment_status.get(email_details['id'], False)
 
@@ -490,9 +1129,9 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
         )
 
 
-def get_raw_email(connection: IMAP4_SSL, email_id: str, folder: str, read_only: bool) -> bytes:
+def get_raw_email(connection: IMAP4_SSL, email_id: str, folder: str, read_only: bool, use_uid: bool = False) -> bytes:
     """
-    Get raw email by ID
+    Get raw email by ID (UID if use_uid)
     Returns the raw email content as bytes
     """
     # Encode folder name to handle special characters
@@ -500,8 +1139,14 @@ def get_raw_email(connection: IMAP4_SSL, email_id: str, folder: str, read_only: 
     connection.select(encoded_folder, readonly=read_only)
 
     # Fetch the raw email by ID
-    fetch_status, data = connection.fetch(email_id, '(RFC822)')
+    fetch_status, data = _imap_command(connection, use_uid, "FETCH", email_id, '(RFC822)')
     if fetch_status == "OK":
+        # UID FETCH of a UID that does not exist returns OK without data
+        if use_uid and (not data or not isinstance(data[0], tuple)):
+            raise All_Exceptions(
+                message=f"Email not found: {email_id}",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
         return data[0][1]
 
     raise All_Exceptions(
@@ -622,11 +1267,11 @@ def _decode_part_text(content: bytes, charset: str) -> str:
     return content.decode("utf-8", errors="replace")
 
 
-def _fetch_email_structure(connection: IMAP4_SSL, email_id: str, with_headers: bool) -> dict:
-    """FETCH the flags, BODYSTRUCTURE and (optionally) the headers of a single email"""
-    query_string = "(FLAGS INTERNALDATE BODYSTRUCTURE BODY.PEEK[HEADER])" if with_headers else "(BODYSTRUCTURE)"
+def _fetch_email_structure(connection: IMAP4_SSL, email_id: str, with_headers: bool, use_uid: bool = False) -> dict:
+    """FETCH the flags, BODYSTRUCTURE and (optionally) the headers of a single email (email_id is a UID if use_uid)"""
+    query_string = "(UID FLAGS INTERNALDATE BODYSTRUCTURE BODY.PEEK[HEADER])" if with_headers else "(BODYSTRUCTURE)"
     try:
-        resp_status, data = connection.fetch(email_id, query_string)
+        resp_status, data = _imap_command(connection, use_uid, "FETCH", email_id, query_string)
     except connection.error as e:
         # The IMAP server rejects ids that do not exist in the folder (e.g. "Invalid messageset")
         raise All_Exceptions(
@@ -649,14 +1294,15 @@ def _fetch_email_structure(connection: IMAP4_SSL, email_id: str, with_headers: b
     )
 
 
-def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_read: bool) -> dict:
+def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_read: bool, use_uid: bool = False) -> dict:
     """
     Get an email for viewing - headers, flags, the text/html body and the list of attachments.
     Only the body parts are downloaded, attachments are NOT downloaded (use get_email_attachment for that).
+    email_id is a UID if use_uid (default: sequence number).
     """
     connection.select(mailbox=folder, readonly=not mark_as_read)
 
-    fetch_data = _fetch_email_structure(connection=connection, email_id=email_id, with_headers=True)
+    fetch_data = _fetch_email_structure(connection=connection, email_id=email_id, with_headers=True, use_uid=use_uid)
     leaf_parts = _bs_leaf_parts(BodyData.create(fetch_data[b"BODYSTRUCTURE"]))
 
     # Body parts are text/plain and text/html parts that are not attachments, everything else is an attachment
@@ -670,7 +1316,7 @@ def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_re
     # Download only the body parts
     body = {"html": None, "text": None}
     if body_parts:
-        resp_status, data = connection.fetch(email_id, "(" + " ".join(f"BODY.PEEK[{part['part_id']}]" for part in body_parts) + ")")
+        resp_status, data = _imap_command(connection, use_uid, "FETCH", email_id, "(" + " ".join(f"BODY.PEEK[{part['part_id']}]" for part in body_parts) + ")")
         if resp_status != "OK":
             raise All_Exceptions(
                 message=f"Failed to fetch email body: {resp_status}; {str(data)}",
@@ -686,7 +1332,7 @@ def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_re
             body[body_type] = text if body[body_type] is None else body[body_type] + "\n" + text
 
     if mark_as_read:
-        connection.store(email_id, "+FLAGS", "\\Seen")
+        _imap_command(connection, use_uid, "STORE", email_id, "+FLAGS", "\\Seen")
 
     # Same header cleanup as the email listing
     email_message = email.message_from_bytes(fetch_data.get(b"BODY[HEADER]") or b"")
@@ -699,6 +1345,7 @@ def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_re
 
     return {
         "id": email_id,
+        "uid": str(fetch_data[b"UID"]) if b"UID" in fetch_data else None,
         "folder_path": folder,
         "headers": headers,
         "flags": flags,
@@ -719,14 +1366,14 @@ def get_email_view(connection: IMAP4_SSL, email_id: str, folder: str, mark_as_re
     }
 
 
-def get_email_attachment(connection: IMAP4_SSL, email_id: str, folder: str, part_id: str) -> dict:
+def get_email_attachment(connection: IMAP4_SSL, email_id: str, folder: str, part_id: str, use_uid: bool = False) -> dict:
     """
-    Download a single attachment (part) of an email.
+    Download a single attachment (part) of an email (email_id is a UID if use_uid).
     Returns a dict with content (decoded bytes), content_type and filename.
     """
     connection.select(mailbox=folder, readonly=True)
 
-    fetch_data = _fetch_email_structure(connection=connection, email_id=email_id, with_headers=False)
+    fetch_data = _fetch_email_structure(connection=connection, email_id=email_id, with_headers=False, use_uid=use_uid)
     leaf_parts = {leaf_part["part_id"]: leaf_part for leaf_part in _bs_leaf_parts(BodyData.create(fetch_data[b"BODYSTRUCTURE"]))}
     if part_id not in leaf_parts:
         raise All_Exceptions(
@@ -735,7 +1382,7 @@ def get_email_attachment(connection: IMAP4_SSL, email_id: str, folder: str, part
         )
     attachment = leaf_parts[part_id]
 
-    resp_status, data = connection.fetch(email_id, f"(BODY.PEEK[{part_id}])")
+    resp_status, data = _imap_command(connection, use_uid, "FETCH", email_id, f"(BODY.PEEK[{part_id}])")
     if resp_status != "OK":
         raise All_Exceptions(
             message=f"Failed to fetch attachment: {resp_status}; {str(data)}",
@@ -777,43 +1424,57 @@ def parse_quota_response(quota_response: str) -> dict:
     }
 
 
-def move_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_folder: str, dest_folder: str) -> dict:
+def move_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_folder: str, dest_folder: str, use_uid: bool = False) -> dict:
     """
     Move multiple emails from source_folder to dest_folder
+    use_uid: email_ids are UIDs - uses UID MOVE (RFC 6851) if the server supports it, otherwise UID COPY + UID STORE \\Deleted
+    and expunges only the moved emails (UID EXPUNGE, if the server supports UIDPLUS)
     """
     # Select the source folder
     select_status, _ = connection.select(mailbox=source_folder, readonly=False)
     if select_status != 'OK':
         return {"error": f"Failed to select source folder: {source_folder}"}
 
+    use_move = use_uid and "MOVE" in _server_capabilities(connection)
+
     results = {}
+    deleted_ids = []
     for email_id in map(str, email_ids):
         try:
-            copy_status, _ = connection.copy(email_id, dest_folder)
+            if use_move:
+                move_status, _ = connection.uid("MOVE", email_id, dest_folder)
+                results[email_id] = "Moved successfully" if move_status == 'OK' else "Move failed"
+                continue
+
+            copy_status, _ = _imap_command(connection, use_uid, "COPY", email_id, dest_folder)
             if copy_status != 'OK':
                 results[email_id] = "Copy failed"
                 continue
 
-            store_status, _ = connection.store(email_id, '+FLAGS', '\\Deleted')
+            store_status, _ = _imap_command(connection, use_uid, "STORE", email_id, '+FLAGS', '\\Deleted')
             if store_status != 'OK':
                 results[email_id] = "Failed to mark as deleted"
                 continue
 
+            deleted_ids.append(email_id)
             results[email_id] = "Moved successfully"
 
         except Exception as e:
             results[email_id] = f"Error: {str(e)}"
 
-    expunge_status, _ = connection.expunge()
+    if use_move:
+        return results
+
+    expunge_status, _ = _expunge_uids(connection, deleted_ids) if use_uid else connection.expunge()
     if expunge_status != 'OK':
         results["expunge"] = "Failed to expunge deleted emails"
 
     return results
 
 
-def copy_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_folder: str, dest_folder: str) -> dict:
+def copy_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_folder: str, dest_folder: str, use_uid: bool = False) -> dict:
     """
-    Copy multiple emails from source_folder to dest_folder
+    Copy multiple emails from source_folder to dest_folder (email_ids are UIDs if use_uid)
     """
     # Select the source folder
     select_status, _ = connection.select(mailbox=source_folder, readonly=True)
@@ -823,7 +1484,7 @@ def copy_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_fol
     results = {}
     for email_uid in map(str, email_ids):
         try:
-            copy_status, _ = connection.copy(email_uid, dest_folder)
+            copy_status, _ = _imap_command(connection, use_uid, "COPY", email_uid, dest_folder)
             if copy_status != 'OK':
                 results[email_uid] = "Copy failed"
                 continue
@@ -836,9 +1497,9 @@ def copy_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_fol
     return results
 
 
-def mark_emails_as_read(connection: IMAP4_SSL, folder: str, email_ids: list[int]) -> dict:
+def mark_emails_as_read(connection: IMAP4_SSL, folder: str, email_ids: list[int], use_uid: bool = False) -> dict:
     """
-    Mark specified emails in the folder as read.
+    Mark specified emails in the folder as read (email_ids are UIDs if use_uid).
     """
     # Select the folder
     select_status, _ = connection.select(mailbox=folder, readonly=False)
@@ -851,7 +1512,7 @@ def mark_emails_as_read(connection: IMAP4_SSL, folder: str, email_ids: list[int]
     results = {}
     for email_uid in map(str, email_ids):
         try:
-            store_status, _ = connection.store(email_uid, '+FLAGS', '\\Seen')
+            store_status, _ = _imap_command(connection, use_uid, "STORE", email_uid, '+FLAGS', '\\Seen')
             if store_status != 'OK':
                 results[email_uid] = "Failed to mark as read"
                 continue
@@ -864,9 +1525,9 @@ def mark_emails_as_read(connection: IMAP4_SSL, folder: str, email_ids: list[int]
     return results
 
 
-def mark_emails_as_unseen(connection: IMAP4_SSL, folder: str, email_ids: list[int]) -> dict:
+def mark_emails_as_unseen(connection: IMAP4_SSL, folder: str, email_ids: list[int], use_uid: bool = False) -> dict:
     """
-    Mark specified emails in the folder as unread.
+    Mark specified emails in the folder as unread (email_ids are UIDs if use_uid).
     """
     # Select the folder
     select_status, _ = connection.select(mailbox=folder, readonly=False)
@@ -879,7 +1540,7 @@ def mark_emails_as_unseen(connection: IMAP4_SSL, folder: str, email_ids: list[in
     results = {}
     for email_uid in map(str, email_ids):
         try:
-            store_status, _ = connection.store(email_uid, '-FLAGS', '\\Seen')
+            store_status, _ = _imap_command(connection, use_uid, "STORE", email_uid, '-FLAGS', '\\Seen')
             if store_status != 'OK':
                 results[email_uid] = "Failed to mark as unread"
                 continue
@@ -892,9 +1553,9 @@ def mark_emails_as_unseen(connection: IMAP4_SSL, folder: str, email_ids: list[in
     return results
 
 
-def mark_emails_as_flagged(connection: IMAP4_SSL, folder: str, email_ids: list[int]) -> dict:
+def mark_emails_as_flagged(connection: IMAP4_SSL, folder: str, email_ids: list[int], use_uid: bool = False) -> dict:
     """
-    Mark specified emails in the folder as flagged.
+    Mark specified emails in the folder as flagged (email_ids are UIDs if use_uid).
     """
     # Select the folder
     select_status, _ = connection.select(mailbox=folder, readonly=False)
@@ -907,7 +1568,7 @@ def mark_emails_as_flagged(connection: IMAP4_SSL, folder: str, email_ids: list[i
     results = {}
     for email_uid in map(str, email_ids):
         try:
-            store_status, _ = connection.store(email_uid, '+FLAGS', '\\Flagged')
+            store_status, _ = _imap_command(connection, use_uid, "STORE", email_uid, '+FLAGS', '\\Flagged')
             if store_status != 'OK':
                 results[email_uid] = "Failed to mark as flagged"
                 continue
@@ -920,9 +1581,9 @@ def mark_emails_as_flagged(connection: IMAP4_SSL, folder: str, email_ids: list[i
     return results
 
 
-def mark_emails_as_unflagged(connection: IMAP4_SSL, folder: str, email_ids: list[int]) -> dict:
+def mark_emails_as_unflagged(connection: IMAP4_SSL, folder: str, email_ids: list[int], use_uid: bool = False) -> dict:
     """
-    Mark specified emails in the folder as unflagged.
+    Mark specified emails in the folder as unflagged (email_ids are UIDs if use_uid).
     """
     # Select the folder
     select_status, _ = connection.select(mailbox=folder, readonly=False)
@@ -935,7 +1596,7 @@ def mark_emails_as_unflagged(connection: IMAP4_SSL, folder: str, email_ids: list
     results = {}
     for email_uid in map(str, email_ids):
         try:
-            store_status, _ = connection.store(email_uid, '-FLAGS', '\\Flagged')
+            store_status, _ = _imap_command(connection, use_uid, "STORE", email_uid, '-FLAGS', '\\Flagged')
             if store_status != 'OK':
                 results[email_uid] = "Failed to mark as unflagged"
                 continue
@@ -948,9 +1609,10 @@ def mark_emails_as_unflagged(connection: IMAP4_SSL, folder: str, email_ids: list
     return results
 
 
-def delete_emails_permanently(connection: IMAP4_SSL, folder: str, email_ids: list[int]) -> dict:
+def delete_emails_permanently(connection: IMAP4_SSL, folder: str, email_ids: list[int], use_uid: bool = False) -> dict:
     """
     Permanently delete specified emails in the folder.
+    use_uid: email_ids are UIDs - only these emails are expunged (UID EXPUNGE, if the server supports UIDPLUS)
     """
     # Select the folder
     select_status, _ = connection.select(mailbox=folder, readonly=False)
@@ -970,7 +1632,10 @@ def delete_emails_permanently(connection: IMAP4_SSL, folder: str, email_ids: lis
 
         # Bulk delete in ONE command
 
-        store_status, _ = connection.store(
+        store_status, _ = _imap_command(
+            connection,
+            use_uid,
+            "STORE",
             uid_set,
             '+FLAGS',
             r'(\Deleted)'
@@ -980,7 +1645,7 @@ def delete_emails_permanently(connection: IMAP4_SSL, folder: str, email_ids: lis
             return {"status": "Failed to mark emails deleted", "uid_set": uid_set}
 
         # Permanently remove
-        expunge_status, _ = connection.expunge()
+        expunge_status, _ = _expunge_uids(connection, email_ids) if use_uid else connection.expunge()
 
         if expunge_status != 'OK':
             return {"status": "Expunge failed", "uid_set": uid_set, "expunge": str(expunge_status)}
@@ -1101,6 +1766,164 @@ def empty_folder(connection: IMAP4_SSL, folder: str) -> int:
 
     # EXPUNGE returns one id per deleted email
     return len([email_id for email_id in data if email_id]) if data and data != [None] else email_count
+
+
+# Actions that change a flag: (STORE command, flag, IMAP search of the emails that still need the change)
+BULK_FLAG_ACTIONS = {
+    "read": ("+FLAGS.SILENT", "(\\Seen)", "UNSEEN"),
+    "unread": ("-FLAGS.SILENT", "(\\Seen)", "SEEN"),
+    "flag": ("+FLAGS.SILENT", "(\\Flagged)", "UNFLAGGED"),
+    "unflag": ("-FLAGS.SILENT", "(\\Flagged)", "FLAGGED")
+}
+BULK_BATCH_SIZE = 5000          # Emails per IMAP command. Scattered UIDs stay well below the 64 KB command limit of Dovecot.
+BULK_TIME_BUDGET_SECONDS = 20   # A request stops starting new batches after this long, the client calls again for the rest
+
+
+def _select_for_bulk(connection: IMAP4_SSL, folder: str, uid_validity: str) -> None:
+    """Select the folder for writing. Refuses if its UIDVALIDITY changed: the selection was made with UIDs that are no longer valid."""
+    resp_status, _ = connection.select(mailbox=_quoted_folder(folder), readonly=False)
+    if resp_status != "OK":
+        raise All_Exceptions(
+            message=f"Folder not found: {folder}",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    _, current_validity = connection.response("UIDVALIDITY")
+    current_validity = current_validity[0].decode() if current_validity and isinstance(current_validity[0], bytes) else None
+    if current_validity != str(uid_validity):
+        raise All_Exceptions(
+            message=f"The folder has changed (UIDVALIDITY {current_validity}), reload it and select the emails again",
+            status_code=status.HTTP_409_CONFLICT
+        )
+
+
+def _bulk_selection(connection: IMAP4_SSL, folder: str, action: str, max_uid: int, excluded: set[str], filter_by: str, search_query: Optional[str], conversations: bool, algorithm: str, uid_validity: str) -> list[list[str]]:
+    """
+    The emails a bulk action still has to change, in groups that must be handled together.
+    Emails that already have the new state are left out, so calling again continues where the last call stopped.
+
+    conversations=True: filter_by and search_query choose conversations and every email of a chosen conversation counts,
+    like the rows of /email/threads, except "unread", which only changes the latest email of each conversation.
+    conversations=False: they choose single emails, like /email/fetch. No THREAD needed either when nothing narrows the folder down.
+    """
+    pending_key = BULK_FLAG_ACTIONS[action][2] if action in BULK_FLAG_ACTIONS else None
+    needs_threads = conversations and (filter_by != "all" or search_query is not None or action == "unread")
+
+    if not needs_threads:
+        criteria = [f"UID 1:{max_uid}"]
+        if filter_by != "all":
+            criteria.append(EMAIL_FILTER_KEYS[filter_by])
+        if search_query is not None:
+            criteria.append(search_query)
+        if pending_key:
+            criteria.append(pending_key)
+        return [[uid] for uid in _uid_search(connection=connection, search_criteria=" ".join(criteria)) if uid not in excluded]
+
+    # _get_folder_threads selects the folder read-only, so select it for writing again afterwards
+    threads = _get_folder_threads(connection=connection, folder_path=folder, algorithm=algorithm)["threads"]
+    threads, _ = _filter_threads(connection=connection, threads=threads, filter_by=filter_by, search_criteria=search_query)
+    pending = set(_uid_search(connection=connection, search_criteria=pending_key)) if pending_key else None
+    _select_for_bulk(connection=connection, folder=folder, uid_validity=uid_validity)
+
+    groups = []
+    for thread in threads:
+        uids = [uid for uid in thread if int(uid) <= max_uid and uid not in excluded]
+        if action == "unread":
+            uids = uids[-1:]
+        if pending is not None:
+            uids = [uid for uid in uids if uid in pending]
+        if uids:
+            groups.append(uids)
+    return groups
+
+
+def _bulk_batches(groups: list[list[str]], batch_size: int) -> list[list[str]]:
+    """
+    Split into batches of about batch_size UIDs, without splitting a group. If a request stopped in the middle of a conversation,
+    the part already changed could make the conversation drop out of the filter (e.g. flagging in the "unflagged" view) and the rest would be skipped.
+    """
+    batches, current = [], []
+    for group in groups:
+        if current and len(current) + len(group) > batch_size:
+            batches.append(current)
+            current = []
+        current.extend(group)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _bulk_apply(connection: IMAP4_SSL, action: str, uids: list[str], dest_folder: Optional[str]) -> None:
+    """Run one action on one batch of UIDs, in as few IMAP commands as possible"""
+    uid_set = compress_ranges([int(uid) for uid in uids])
+
+    if action in BULK_FLAG_ACTIONS:
+        store_command, flag, _ = BULK_FLAG_ACTIONS[action]
+        responses = [connection.uid("STORE", uid_set, store_command, flag)]
+    elif action == "move" and "MOVE" in _server_capabilities(connection):
+        responses = [connection.uid("MOVE", uid_set, _quoted_folder(dest_folder))]
+    else:
+        responses = []
+        if action == "move":
+            responses.append(connection.uid("COPY", uid_set, _quoted_folder(dest_folder)))
+        if all(resp_status == "OK" for resp_status, _ in responses):
+            responses.append(connection.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)"))
+        if all(resp_status == "OK" for resp_status, _ in responses):
+            responses.append(_expunge_uids(connection, uids))
+
+    for resp_status, data in responses:
+        if resp_status != "OK":
+            raise All_Exceptions(
+                message=f"IMAP refused the {action}: {resp_status}; {str(data)}",
+                status_code=status.HTTP_424_FAILED_DEPENDENCY
+            )
+
+
+def bulk_email_action(connection: IMAP4_SSL, folder: str, action: str, max_uid: int, uid_validity: str, exclude_uids: Optional[list[int]] = None, filter_by: str = "all", search_criteria: Optional[SearchMail] = None, conversations: bool = True, dest_folder: Optional[str] = None, algorithm: str = "refs", time_budget: float = BULK_TIME_BUDGET_SECONDS, batch_size: int = BULK_BATCH_SIZE) -> dict:
+    """
+    Run an action on all emails of a folder (or of a filter / search), not only on the loaded page.
+    max_uid: the newest email when the user selected all - mail that arrives later is not touched.
+    exclude_uids: emails the user unselected.
+    Returns done (changed by this call) and remaining (call again while it is above 0).
+    unread_affected: unread emails among those moved or deleted, for the folder counts.
+    """
+    if action == "delete" and not is_trash_or_junk_folder(connection, folder):
+        raise All_Exceptions(
+            message="Emails can only be deleted permanently from a Trash or Spam folder, move them to Trash instead",
+            status_code=status.HTTP_403_FORBIDDEN
+        )
+
+    _select_for_bulk(connection=connection, folder=folder, uid_validity=uid_validity)
+
+    result = {"folder_path": folder, "action": action, "done": 0, "remaining": 0, "unread_affected": 0}
+    if max_uid < 1:     # 1:0 would mean UID 1 in IMAP
+        return result
+
+    groups = _bulk_selection(
+        connection=connection,
+        folder=folder,
+        action=action,
+        max_uid=max_uid,
+        excluded={str(uid) for uid in exclude_uids or []},
+        filter_by=filter_by,
+        search_query=_search_mail_criteria(search_criteria) if search_criteria else None,
+        conversations=conversations,
+        algorithm=algorithm,
+        uid_validity=uid_validity
+    )
+    unread_uids = set(_uid_search(connection=connection, search_criteria="UNSEEN")) if action in ("move", "delete") and groups else set()
+
+    batches = _bulk_batches(groups=groups, batch_size=batch_size)
+    started_at = time.monotonic()
+    for index, batch in enumerate(batches):
+        if index and time.monotonic() - started_at >= time_budget:
+            result["remaining"] = sum(len(uids) for uids in batches[index:])
+            break
+        _bulk_apply(connection=connection, action=action, uids=batch, dest_folder=dest_folder)
+        result["done"] += len(batch)
+        result["unread_affected"] += sum(uid in unread_uids for uid in batch)
+
+    return result
 
 
 def _build_search_criteria(query: dict) -> str:
@@ -1279,14 +2102,59 @@ def search_emails(connection: IMAP4_SSL, search_criteria: SearchMail) -> dict:
     }
 
 
-def get_email_details_by_message_id(imap_connection: IMAP4_SSL, message_ids: list[str], folder: str) -> list[dict]:
+def _search_mail_criteria(search_criteria: SearchMail) -> str:
+    """The IMAP search of a search form (the same one for the search endpoints and for bulk actions)"""
+    return _build_search_criteria(
+        {
+            "from": search_criteria.from_,
+            "to": search_criteria.to,
+            "subject": search_criteria.subject,
+            "size": {
+                "comparator": search_criteria.size.comparator,
+                "size": search_criteria.size.size
+            } if search_criteria.size else None,
+            "date_on": search_criteria.date_on,
+            "date_since": search_criteria.date_since
+        }
+    )
+
+
+def search_threads(connection: IMAP4_SSL, search_criteria: SearchMail, filter_by: str = "all", algorithm: str = "refs", include_sent: bool = False, sent_folder: Optional[str] = None) -> dict:
     """
-    Fetch email details by Message-ID
+    Search emails and return the conversations (threads) that contain at least one matching email.
+    Uses the same search criteria as search_emails, pagination (page / limit) is by conversation.
+    """
+    search_query = _search_mail_criteria(search_criteria)
+
+    page, limit = search_criteria.page or 1, search_criteria.limit or 50
+    return {
+        "folder_path": search_criteria.folder,
+        "page": page,
+        "limit": limit,
+        **get_thread_page(
+            connection=connection,
+            folder_path=search_criteria.folder,
+            batch_size=limit,
+            page_number=page,
+            sort_order=search_criteria.sort_order or "desc",
+            filter_by=filter_by,
+            full_headers=bool(search_criteria.full_headers),
+            algorithm=algorithm,
+            search_criteria=search_query,
+            include_sent=include_sent,
+            sent_folder=sent_folder
+        )
+    }
+
+
+def get_email_details_by_message_id(imap_connection: IMAP4_SSL, message_ids: list[str], folder: str, use_uid: bool = False) -> list[dict]:
+    """
+    Fetch email details by Message-ID ("id" of each email is its UID if use_uid)
     """
     imap_connection.select(folder, readonly=True)
 
     # Search all the Message-IDs in one go (the folder is scanned once instead of once per Message-ID)
-    email_ids = _search_message_ids(imap_connection=imap_connection, message_ids=message_ids)
+    email_ids = _search_message_ids(imap_connection=imap_connection, message_ids=message_ids, use_uid=use_uid)
 
     if not email_ids:
         raise All_Exceptions(
@@ -1298,7 +2166,8 @@ def get_email_details_by_message_id(imap_connection: IMAP4_SSL, message_ids: lis
         connection=imap_connection,
         id_range=",".join(email_ids),
         folder_path=folder,
-        full_headers=True
+        full_headers=True,
+        use_uid=use_uid
     )
 
     # Add a new key 'Message-ID' to each finding (the requested Message-ID it was found by)
@@ -1307,7 +2176,8 @@ def get_email_details_by_message_id(imap_connection: IMAP4_SSL, message_ids: lis
         # Could not match every finding from its headers - use the per Message-ID search (old behaviour)
         uids = {}
         for message_id in message_ids:
-            status_, data = imap_connection.search(None, f'(HEADER Message-ID {_imap_quote(message_id)})')
+            search_query = f'(HEADER Message-ID {_imap_quote(message_id)})'
+            status_, data = imap_connection.uid("SEARCH", search_query) if use_uid else imap_connection.search(None, search_query)
             if status_ == "OK" and data != [b'']:
                 for uid in data[0].split():
                     uids[uid.decode()] = message_id
@@ -1324,10 +2194,10 @@ def _imap_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _search_message_ids(imap_connection: IMAP4_SSL, message_ids: list[str], chunk_size: int = 50) -> list[str]:
+def _search_message_ids(imap_connection: IMAP4_SSL, message_ids: list[str], chunk_size: int = 50, use_uid: bool = False) -> list[str]:
     """
     Search emails by Message-ID with a single SEARCH per chunk of Message-IDs (OR of all of them).
-    Returns the email ids (sorted ascending, no duplicates).
+    Returns the email ids (UIDs if use_uid) sorted ascending, no duplicates.
     """
     unique_message_ids = list(dict.fromkeys(message_ids))
     email_ids = set()
@@ -1340,7 +2210,7 @@ def _search_message_ids(imap_connection: IMAP4_SSL, message_ids: list[str], chun
         for search_term in reversed(search_terms[:-1]):
             search_query = f"OR {search_term} {search_query}"
 
-        status_, data = imap_connection.search(None, f"({search_query})")
+        status_, data = imap_connection.uid("SEARCH", f"({search_query})") if use_uid else imap_connection.search(None, f"({search_query})")
         if status_ == "OK" and data and data[0]:
             email_ids.update(data[0].decode().split())
 

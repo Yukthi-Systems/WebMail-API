@@ -36,7 +36,7 @@ from src.utils.base.libraries import (
 )
 from src.database import get_all_templates, PostgresDep, create_template, delete_template, edit_template, get_template
 from src.main import CurrentUser, send_mail_rabbit, draft_mail_rabbit
-from src.utils.models import SendMailForm, SearchMail, EmailTemplate, All_Exceptions
+from src.utils.models import SendMailForm, SearchMail, BulkEmailAction, EmailTemplate, All_Exceptions
 from src.imap import (
     get_imap_connection_from_user_data,
     get_email_details_by_message_id,
@@ -53,8 +53,12 @@ from src.imap import (
     get_email_attachment,
     get_email_details,
     get_email_view,
+    get_thread_page,
+    get_thread_emails,
     get_raw_email,
-    search_emails
+    search_threads,
+    search_emails,
+    bulk_email_action
 )
 
 # Router
@@ -224,15 +228,156 @@ def _fetch_sorted_emails(imap_connection, folder_path: str, full_headers: bool, 
     )
 
 
+# Get conversations (threads) of a folder - one row per conversation
+@router.get("/threads/{batch_size}/{page_number}", response_class=JSONResponse, tags=["E-Mail", "Thread"], summary="Fetch conversations (threads) from a given folder path")
+def fetch_threads(
+    folder_path: str,
+    batch_size: int,
+    page_number: int,
+    user: CurrentUser,
+    full_headers: bool = False,
+    sort_order: Literal["desc", "asc"] = "desc",
+    filter_by: Literal["all", "unread", "read", "flagged", "unflagged"] = "all",
+    algorithm: Literal["refs", "references"] = "refs",
+    include_sent: bool = True,
+    sent_folder: Optional[str] = None
+) -> JSONResponse:
+    """
+    Fetch a page of conversations (threads) from a folder. All email ids are UIDs (use use_uid=true on the other endpoints).
+    Emails are grouped on the IMAP server (IMAP THREAD, RFC 5256) across the whole folder, so a conversation is never split over pages.
+    Pagination is by conversation (batch_size conversations per page), ordered by the latest email of each conversation.
+        sort_order: desc (newest conversation first, default) or asc
+        filter_by: all (default), unread / flagged (at least one such email), read / unflagged (no such email)
+        algorithm: refs (default, References / In-Reply-To headers only - emails sharing only a subject stay separate)
+                   or references (RFC 5256 - the same headers, and also groups emails by subject)
+        include_sent: true (default) to add your replies from the Sent folder to each conversation (counted in message_count / participants,
+                      listed in sent_email_ids). The order and pagination stay by the emails of this folder.
+        sent_folder: path of the Sent folder (default: found by its \\Sent flag or name "Sent")
+    total_count / total_pages count conversations, total_messages counts the emails in them.
+    """
+    if batch_size < 1:
+        return JSONResponse(
+            content={"message": "Batch size must be greater than 0"},
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+    if page_number < 1:
+        return JSONResponse(
+            content={"message": "Page number must be greater than 0"},
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        thread_page = get_thread_page(
+            connection=imap_connection,
+            folder_path=folder_path,
+            batch_size=batch_size,
+            page_number=page_number,
+            sort_order=sort_order,
+            filter_by=filter_by,
+            full_headers=full_headers,
+            algorithm=algorithm,
+            include_sent=include_sent,
+            sent_folder=sent_folder
+        )
+
+        if thread_page["total_count"] and page_number > thread_page["total_pages"]:
+            return JSONResponse(
+                content={"message": "Page number exceeds total pages"},
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+        return JSONResponse(
+            content={
+                "message": "Threads fetched successfully" if thread_page["total_count"] else "No emails found in the specified folder",
+                "folder_path": folder_path,
+                "total_count": thread_page["total_count"],
+                "total_pages": thread_page["total_pages"],
+                "total_messages": thread_page["total_messages"],
+                "batch_size": batch_size,
+                "sort_order": sort_order,
+                "filter_by": filter_by,
+                "algorithm": thread_page["algorithm"],
+                "uid_validity": thread_page["uid_validity"],
+                "sent_folder_path": thread_page["sent_folder_path"],
+                "threads": thread_page["threads"]
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to fetch threads: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
+# Get all the emails of a conversation (thread)
+@router.get("/thread/{email_id}", response_class=JSONResponse, tags=["E-Mail", "Thread"], summary="Fetch all emails of the conversation (thread) of an email")
+def fetch_thread_emails(
+    email_id: str,
+    folder_path: str,
+    user: CurrentUser,
+    full_headers: bool = False,
+    algorithm: Literal["refs", "references"] = "refs",
+    include_sent: bool = True,
+    sent_folder: Optional[str] = None
+) -> JSONResponse:
+    """
+    Fetch the conversation (thread) that contains the given email (email_id is a UID): the thread summary and all its emails, oldest first.
+    Use /email/view/{email_id}?use_uid=true&folder_path=<the email's folder_path> to load the body of each email.
+        include_sent: true (default) to add your replies from the Sent folder in date order - every email then has folder_path
+        sent_folder: path of the Sent folder (default: found by its \\Sent flag or name "Sent")
+    """
+    if not email_id.isdigit():
+        raise All_Exceptions(message="Invalid email ID", status_code=status.HTTP_400_BAD_REQUEST)
+
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        return JSONResponse(
+            content={
+                "message": "Thread fetched successfully",
+                "folder_path": folder_path,
+                **get_thread_emails(
+                    connection=imap_connection,
+                    folder_path=folder_path,
+                    email_uid=email_id,
+                    full_headers=full_headers,
+                    algorithm=algorithm,
+                    include_sent=include_sent,
+                    sent_folder=sent_folder
+                )
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to fetch thread: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
 # Get Raw Email
 @router.get("/raw/{email_id}", response_class=PlainTextResponse, tags=["E-Mail"], summary="Get raw email by ID")
-def get_raw_email_as_plain_text(email_id: str, folder_path: str, mark_as_read: bool, user: CurrentUser) -> PlainTextResponse:
-    """Get raw email by ID"""
+def get_raw_email_as_plain_text(email_id: str, folder_path: str, mark_as_read: bool, user: CurrentUser, use_uid: bool = False) -> PlainTextResponse:
+    """
+    Get raw email by ID
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     # Fetch the raw email
     try:
-        if raw_bytes := get_raw_email(connection=imap_connection, email_id=email_id, folder=folder_path, read_only=not mark_as_read):
+        if raw_bytes := get_raw_email(connection=imap_connection, email_id=email_id, folder=folder_path, read_only=not mark_as_read, use_uid=use_uid):
             return PlainTextResponse(
                 content=raw_bytes,
                 status_code=status.HTTP_200_OK,
@@ -257,11 +402,12 @@ def get_raw_email_as_plain_text(email_id: str, folder_path: str, mark_as_read: b
 
 # View an email - body only, attachments are listed but not downloaded
 @router.get("/view/{email_id}", response_class=JSONResponse, tags=["E-Mail"], summary="View an email (body only, attachments are downloaded separately)")
-def view_email(email_id: str, folder_path: str, mark_as_read: bool, user: CurrentUser) -> JSONResponse:
+def view_email(email_id: str, folder_path: str, mark_as_read: bool, user: CurrentUser, use_uid: bool = False) -> JSONResponse:
     """
     View an email - returns the headers, flags, text/html body and the list of attachments.
     Attachments are NOT downloaded, use /email/attachment/{email_id}/{part_id} to download one.
     Inline images in the html body are referenced as "cid:<content_id>" - match them with the content_id of the attachments.
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
     """
     if not email_id.isdigit():
         raise All_Exceptions(message="Invalid email ID", status_code=status.HTTP_400_BAD_REQUEST)
@@ -272,7 +418,7 @@ def view_email(email_id: str, folder_path: str, mark_as_read: bool, user: Curren
         return JSONResponse(
             content={
                 "message": "Email fetched successfully",
-                **get_email_view(connection=imap_connection, email_id=email_id, folder=folder_path, mark_as_read=mark_as_read)
+                **get_email_view(connection=imap_connection, email_id=email_id, folder=folder_path, mark_as_read=mark_as_read, use_uid=use_uid)
             },
             status_code=status.HTTP_200_OK
         )
@@ -289,11 +435,12 @@ def view_email(email_id: str, folder_path: str, mark_as_read: bool, user: Curren
 
 # Download a single attachment of an email
 @router.get("/attachment/{email_id}/{part_id}", tags=["E-Mail"], summary="Download a single attachment of an email")
-def download_email_attachment(email_id: str, part_id: str, folder_path: str, user: CurrentUser, inline: bool = False) -> Response:
+def download_email_attachment(email_id: str, part_id: str, folder_path: str, user: CurrentUser, inline: bool = False, use_uid: bool = False) -> Response:
     """
     Download a single attachment of an email.
     part_id comes from the attachments list of /email/view/{email_id}
     inline: true to show it in the browser (e.g. images, pdf), false to download it as a file (default)
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
     """
     if not email_id.isdigit() or not re.fullmatch(r"\d+(\.\d+)*", part_id):
         raise All_Exceptions(message="Invalid email ID or part ID", status_code=status.HTTP_400_BAD_REQUEST)
@@ -301,7 +448,7 @@ def download_email_attachment(email_id: str, part_id: str, folder_path: str, use
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     try:
-        attachment = get_email_attachment(connection=imap_connection, email_id=email_id, folder=folder_path, part_id=part_id)
+        attachment = get_email_attachment(connection=imap_connection, email_id=email_id, folder=folder_path, part_id=part_id, use_uid=use_uid)
 
         # ASCII fallback filename for old clients + the real (utf-8) filename (RFC 6266)
         ascii_filename = attachment["filename"].encode("ascii", errors="replace").decode().replace("?", "_").replace('"', "_")
@@ -328,8 +475,11 @@ def download_email_attachment(email_id: str, part_id: str, folder_path: str, use
 
 # Get emails given in a list
 @router.get("/fetch-all", response_class=JSONResponse, tags=["E-Mail"], summary="Fetch emails from a folder based on IDs")
-def fetch_emails_based_on_ids(folder_path: str, full_headers: bool, email_ids: list[int], user: CurrentUser) -> JSONResponse:
-    """Fetch emails from a folder based on IDs"""
+def fetch_emails_based_on_ids(folder_path: str, full_headers: bool, email_ids: list[int], user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Fetch emails from a folder based on IDs
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     # Fetch the emails
@@ -342,9 +492,10 @@ def fetch_emails_based_on_ids(folder_path: str, full_headers: bool, email_ids: l
                 "folder_path": folder_path,
                 "emails": get_email_details(
                     connection=imap_connection,
-                    id_range=",".join(email_ids),
+                    id_range=",".join(map(str, email_ids)),
                     folder_path=folder_path,
-                    full_headers=full_headers
+                    full_headers=full_headers,
+                    use_uid=use_uid
                 )
             },
             status_code=status.HTTP_200_OK
@@ -385,8 +536,11 @@ def create_draft_email(user: CurrentUser, data: str = Form(...), attachments: li
 
 # Copy single or multiple emails from one folder to another
 @router.patch("/copy", response_class=JSONResponse, tags=["E-Mail", "Folder"], summary="Copy emails from one folder to another")
-def copy_emails(folder_path: str, email_ids: list[int], source_folder: str, dest_folder: str, user: CurrentUser) -> JSONResponse:
-    """Copy emails from one folder to another"""
+def copy_emails(folder_path: str, email_ids: list[int], source_folder: str, dest_folder: str, user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Copy emails from one folder to another
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
     email_ids = sorted(list(set(email_ids)), reverse=True)
 
@@ -396,7 +550,8 @@ def copy_emails(folder_path: str, email_ids: list[int], source_folder: str, dest
             connection=imap_connection,
             email_ids=email_ids,
             source_folder=source_folder,
-            dest_folder=dest_folder
+            dest_folder=dest_folder,
+            use_uid=use_uid
         )
 
         return JSONResponse(
@@ -418,8 +573,11 @@ def copy_emails(folder_path: str, email_ids: list[int], source_folder: str, dest
 
 # Move single or multiple emails from one folder to another
 @router.put("/move", response_class=JSONResponse, tags=["E-Mail", "Folder"], summary="Move emails from one folder to another")
-def move_emails(folder_path: str, email_ids: list[int], source_folder: str, dest_folder: str, user: CurrentUser) -> JSONResponse:
-    """Move emails from one folder to another"""
+def move_emails(folder_path: str, email_ids: list[int], source_folder: str, dest_folder: str, user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Move emails from one folder to another
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
     email_ids = sorted(list(set(email_ids)), reverse=True)
 
@@ -429,7 +587,8 @@ def move_emails(folder_path: str, email_ids: list[int], source_folder: str, dest
             connection=imap_connection,
             email_ids=email_ids,
             source_folder=source_folder,
-            dest_folder=dest_folder
+            dest_folder=dest_folder,
+            use_uid=use_uid
         )
 
         expunge_status = resp.pop("expunge", "Expunge not performed")
@@ -454,8 +613,11 @@ def move_emails(folder_path: str, email_ids: list[int], source_folder: str, dest
 
 # Mark selected emails as read
 @router.put("/mark/read", response_class=JSONResponse, tags=["E-Mail"], summary="Mark selected emails as read")
-def mark_all_emails_as_read(folder_path: str, email_ids: list[int], user: CurrentUser) -> JSONResponse:
-    """Mark all emails in a folder as read"""
+def mark_all_emails_as_read(folder_path: str, email_ids: list[int], user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Mark the selected emails in a folder as read
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     # Mark all emails as read
@@ -467,7 +629,8 @@ def mark_all_emails_as_read(folder_path: str, email_ids: list[int], user: Curren
                 "results": mark_emails_as_read(
                     connection=imap_connection,
                     email_ids=email_ids,
-                    folder=folder_path
+                    folder=folder_path,
+                    use_uid=use_uid
                 )
             },
             status_code=status.HTTP_200_OK
@@ -482,8 +645,11 @@ def mark_all_emails_as_read(folder_path: str, email_ids: list[int], user: Curren
 
 # Mark selected emails as unread
 @router.patch("/mark/unseen", response_class=JSONResponse, tags=["E-Mail"], summary="Mark selected emails as unread")
-def mark_all_emails_as_unread(folder_path: str, email_ids: list[int], user: CurrentUser) -> JSONResponse:
-    """Mark all emails in a folder as unread"""
+def mark_all_emails_as_unread(folder_path: str, email_ids: list[int], user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Mark the selected emails in a folder as unread
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     # Mark all emails as unread
@@ -495,7 +661,8 @@ def mark_all_emails_as_unread(folder_path: str, email_ids: list[int], user: Curr
                 "results": mark_emails_as_unseen(
                     connection=imap_connection,
                     email_ids=email_ids,
-                    folder=folder_path
+                    folder=folder_path,
+                    use_uid=use_uid
                 )
             },
             status_code=status.HTTP_200_OK
@@ -510,8 +677,11 @@ def mark_all_emails_as_unread(folder_path: str, email_ids: list[int], user: Curr
 
 # Mark selected emails as flagged
 @router.put("/mark/flagged", response_class=JSONResponse, tags=["E-Mail"], summary="Mark selected emails as flagged")
-def mark_all_emails_as_flagged(folder_path: str, email_ids: list[int], user: CurrentUser) -> JSONResponse:
-    """Mark all emails in a folder as flagged"""
+def mark_all_emails_as_flagged(folder_path: str, email_ids: list[int], user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Mark the selected emails in a folder as flagged
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     # Mark all emails as flagged
@@ -523,7 +693,8 @@ def mark_all_emails_as_flagged(folder_path: str, email_ids: list[int], user: Cur
                 "results": mark_emails_as_flagged(
                     connection=imap_connection,
                     email_ids=email_ids,
-                    folder=folder_path
+                    folder=folder_path,
+                    use_uid=use_uid
                 )
             },
             status_code=status.HTTP_200_OK
@@ -538,8 +709,11 @@ def mark_all_emails_as_flagged(folder_path: str, email_ids: list[int], user: Cur
 
 # Mark selected emails as unflagged
 @router.patch("/mark/unflagged", response_class=JSONResponse, tags=["E-Mail"], summary="Mark selected emails as unflagged")
-def mark_all_emails_as_unflagged(folder_path: str, email_ids: list[int], user: CurrentUser) -> JSONResponse:
-    """Mark all emails in a folder as unflagged"""
+def mark_all_emails_as_unflagged(folder_path: str, email_ids: list[int], user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Mark the selected emails in a folder as unflagged
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
     # Mark all emails as unflagged
@@ -551,7 +725,8 @@ def mark_all_emails_as_unflagged(folder_path: str, email_ids: list[int], user: C
                 "results": mark_emails_as_unflagged(
                     connection=imap_connection,
                     email_ids=email_ids,
-                    folder=folder_path
+                    folder=folder_path,
+                    use_uid=use_uid
                 )
             },
             status_code=status.HTTP_200_OK
@@ -566,8 +741,11 @@ def mark_all_emails_as_unflagged(folder_path: str, email_ids: list[int], user: C
 
 # Permanently delete selected emails
 @router.delete("/permanently", response_class=JSONResponse, tags=["E-Mail", "Folder"], summary="Permanently delete selected emails")
-def permanently_delete_emails(folder_path: str, email_ids: list[int], user: CurrentUser) -> JSONResponse:
-    """Permanently delete selected emails"""
+def permanently_delete_emails(folder_path: str, email_ids: list[int], user: CurrentUser, use_uid: bool = False) -> JSONResponse:
+    """
+    Permanently delete selected emails
+    use_uid: true if the email ids are UIDs (the "uid" of each email in the listings) - recommended, a UID does not change when other emails are deleted or moved. Default false: sequence numbers (old behaviour).
+    """
     imap_connection = get_imap_connection_from_user_data(user=user)
     email_ids = sorted(list(set(email_ids)), reverse=True)
 
@@ -576,7 +754,8 @@ def permanently_delete_emails(folder_path: str, email_ids: list[int], user: Curr
         resp = delete_emails_permanently(
             connection=imap_connection,
             email_ids=email_ids,
-            folder=folder_path
+            folder=folder_path,
+            use_uid=use_uid
         )
 
         expunge_status = resp.pop("expunge", "Expunge not performed")
@@ -611,6 +790,52 @@ def permanently_delete_emails(folder_path: str, email_ids: list[int], user: Curr
         )
 
 
+# Run an action on all emails of a folder, filter or search
+@router.post("/bulk", response_class=JSONResponse, tags=["E-Mail", "Folder"], summary="Run an action on all emails of a folder, filter or search")
+def bulk_emails(form: BulkEmailAction, user: CurrentUser) -> JSONResponse:
+    """
+    Mark, flag, move or delete all emails of a folder, filter or search, not only the loaded page. All ids are UIDs.
+    A request works for about 20 seconds: while "remaining" is above 0, send the same request again. Emails already done are skipped, so repeating a request is safe.
+    """
+    if form.action == "move" and (not form.dest_folder or form.dest_folder == form.folder_path):
+        return JSONResponse(
+            content={"message": "Move needs a dest_folder other than the folder itself"},
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        return JSONResponse(
+            content={
+                "message": "Bulk action finished",
+                **bulk_email_action(
+                    connection=imap_connection,
+                    folder=form.folder_path,
+                    action=form.action,
+                    max_uid=form.max_uid,
+                    uid_validity=form.uid_validity,
+                    exclude_uids=form.exclude_uids,
+                    filter_by=form.filter_by,
+                    search_criteria=form.search,
+                    conversations=form.conversations,
+                    dest_folder=form.dest_folder,
+                    algorithm=form.algorithm
+                )
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to run the bulk action: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
 # Search the emails
 @router.post("/search/all", response_class=JSONResponse, tags=["E-Mail"], summary="Search emails")
 def search_all_emails(search_criteria: SearchMail, user: CurrentUser) -> JSONResponse:
@@ -632,6 +857,56 @@ def search_all_emails(search_criteria: SearchMail, user: CurrentUser) -> JSONRes
     except Exception as e:
         return JSONResponse(
             content={"message": f"Failed to fetch emails: {str(e)}"},
+            status_code=status.HTTP_424_FAILED_DEPENDENCY
+        )
+
+
+# Search the emails - one row per conversation (thread)
+@router.post("/search/threads", response_class=JSONResponse, tags=["E-Mail", "Thread"], summary="Search emails and return their conversations (threads)")
+def search_all_threads(
+    search_criteria: SearchMail,
+    user: CurrentUser,
+    filter_by: Literal["all", "unread", "read", "flagged", "unflagged"] = "all",
+    algorithm: Literal["refs", "references"] = "refs",
+    include_sent: bool = True,
+    sent_folder: Optional[str] = None
+) -> JSONResponse:
+    """
+    Search emails (same criteria as /email/search/all) and return the conversations (threads) that contain at least one matching email.
+    Pagination (page / limit) is by conversation, ordered by the latest email of each conversation (sort_order: desc or asc, sort_by is not used).
+    Every thread has matched_email_ids - the emails of the thread that match the search. All email ids are UIDs.
+    include_sent / sent_folder: same as /email/threads
+    """
+    if (search_criteria.page is not None and search_criteria.page < 1) or (search_criteria.limit is not None and search_criteria.limit < 1):
+        return JSONResponse(
+            content={"message": "Page and limit must be greater than 0"},
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+    imap_connection = get_imap_connection_from_user_data(user=user)
+
+    try:
+        return JSONResponse(
+            content={
+                "message": "Search threads fetched successfully",
+                "data": search_threads(
+                    connection=imap_connection,
+                    search_criteria=search_criteria,
+                    filter_by=filter_by,
+                    algorithm=algorithm,
+                    include_sent=include_sent,
+                    sent_folder=sent_folder
+                )
+            },
+            status_code=status.HTTP_200_OK
+        )
+
+    except All_Exceptions:
+        raise
+
+    except Exception as e:
+        return JSONResponse(
+            content={"message": f"Failed to search threads: {str(e)}"},
             status_code=status.HTTP_424_FAILED_DEPENDENCY
         )
 
@@ -779,9 +1054,10 @@ async def edit_email_template(template_id: int, template_data: EmailTemplate, us
 
 # Get email details by Message-ID's
 @router.post("/fetch-by-message-ids", response_class=JSONResponse, tags=["E-Mail"], summary="Fetch email details by Message-ID's")
-def fetch_email_details_by_message_ids(folder_path: str, message_ids: list[str], user: CurrentUser) -> JSONResponse:
+def fetch_email_details_by_message_ids(folder_path: str, message_ids: list[str], user: CurrentUser, use_uid: bool = False) -> JSONResponse:
     """
     Fetch email details by Message-ID's
+    use_uid: true to return the UID as "id" of each email (default false: sequence number, old behaviour)
     """
     imap_connection = get_imap_connection_from_user_data(user=user)
 
@@ -789,7 +1065,8 @@ def fetch_email_details_by_message_ids(folder_path: str, message_ids: list[str],
         findings = get_email_details_by_message_id(
             imap_connection=imap_connection,
             message_ids=message_ids,
-            folder=folder_path
+            folder=folder_path,
+            use_uid=use_uid
         )
         return JSONResponse(
             content={

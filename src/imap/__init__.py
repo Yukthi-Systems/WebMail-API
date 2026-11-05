@@ -19,7 +19,7 @@ All the IMAP related functions and classes are defined in this module
 
 
 from .connections import get_imap_connection, get_imap_connection_from_user_data, is_login_rejected
-from .handlers import list_folders, parse_acl_response, parse_imap_response, get_email_details, get_raw_email, parse_quota_response, move_multiple_emails, copy_multiple_emails, mark_emails_as_read, mark_emails_as_unseen, mark_emails_as_flagged, mark_emails_as_unflagged, delete_emails_permanently, search_emails, get_email_details_by_message_id, mark_folder_as_read, is_trash_or_junk_folder, empty_folder, get_sorted_email_ids, get_email_view, get_email_attachment
+from .handlers import list_folders, parse_acl_response, parse_imap_response, get_email_details, get_raw_email, parse_quota_response, move_multiple_emails, copy_multiple_emails, mark_emails_as_read, mark_emails_as_unseen, mark_emails_as_flagged, mark_emails_as_unflagged, delete_emails_permanently, search_emails, get_email_details_by_message_id, mark_folder_as_read, is_trash_or_junk_folder, empty_folder, get_sorted_email_ids, get_email_view, get_email_attachment, get_thread_page, get_thread_emails, search_threads, bulk_email_action
 
 
 __version__ = "v2.6.2-phoenix-release"
@@ -40,6 +40,10 @@ __annotations__ = {
     "get_sorted_email_ids": "Function to get email ids of a folder filtered and sorted on the server",
     "get_email_view": "Function to get an email for viewing (headers, body and attachment list) without downloading the attachments",
     "get_email_attachment": "Function to download a single attachment of an email",
+    "get_thread_page": "Function to get a page of conversations (threads) of a folder",
+    "get_thread_emails": "Function to get all the emails of a conversation (thread)",
+    "search_threads": "Function to search emails and return the conversations (threads) they belong to",
+    "bulk_email_action": "Function to run an action on all emails of a folder, filter or search",
     "get_raw_email": "Function to get raw email by ID",
     "parse_quota_response": "Function to parse the quota response from the server",
     "move_multiple_emails": "Function to move multiple emails from one folder to another",
@@ -68,6 +72,10 @@ __all__ = [
     "get_sorted_email_ids",
     "get_email_view",
     "get_email_attachment",
+    "get_thread_page",
+    "get_thread_emails",
+    "search_threads",
+    "bulk_email_action",
     "get_raw_email",
     "parse_quota_response",
     "move_multiple_emails",
