@@ -43,6 +43,8 @@ def get_imap_connection(imap_user: str, imap_password: str, imap_server: str, im
         try:
             connection = IMAP4_SSL(host=imap_server, port=imap_port, timeout=60)
             connection.login(user=imap_user, password=imap_password)
+            # imaplib only sends ASCII by default, a search for "café" or "नमस्ते" would fail before reaching the server
+            connection._encoding = "utf-8"
             return connection
 
         except Exception as e:

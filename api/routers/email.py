@@ -451,15 +451,17 @@ def download_email_attachment(email_id: str, part_id: str, folder_path: str, use
         attachment = get_email_attachment(connection=imap_connection, email_id=email_id, folder=folder_path, part_id=part_id, use_uid=use_uid)
 
         # ASCII fallback filename for old clients + the real (utf-8) filename (RFC 6266)
-        ascii_filename = attachment["filename"].encode("ascii", errors="replace").decode().replace("?", "_").replace('"', "_")
+        # Both come from the email, which can have anything in them: only safe characters may go into a response header
+        ascii_filename = re.sub(r'[^\x20-\x7e]|["\\?]', "_", attachment["filename"])
+        content_type = attachment["content_type"] if re.fullmatch(r"[\w.+-]+/[\w.+-]+", attachment["content_type"], re.ASCII) else "application/octet-stream"
         disposition = "inline" if inline else "attachment"
 
         return Response(
             content=attachment["content"],
             status_code=status.HTTP_200_OK,
-            media_type=attachment["content_type"],
+            media_type=content_type,
             headers={
-                "Content-Disposition": f"{disposition}; filename=\"{ascii_filename}\"; filename*=UTF-8''{url_quote(attachment['filename'])}"
+                "Content-Disposition": f"{disposition}; filename=\"{ascii_filename}\"; filename*=UTF-8''{url_quote(attachment['filename'], safe='')}"
             }
         )
 

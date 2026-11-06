@@ -710,6 +710,11 @@ def _header_message_ids(value: str) -> list[str]:
     return [message_id.lower() for message_id in re.findall(r"<[^<>\s]+>", value)]
 
 
+def _searchable_message_id(message_id: str) -> bool:
+    """Only printable ASCII can be sent in an IMAP search. Another character would make the search of all emails on the page fail."""
+    return all(33 <= ord(char) <= 126 for char in message_id)
+
+
 def _own_message_id(email_details: dict) -> Optional[str]:
     message_ids = _header_message_ids(_header_value(email_details, "Message-ID"))
     return message_ids[0] if message_ids else None
@@ -724,7 +729,7 @@ def _email_datetime(email_details: dict) -> Optional[datetime]:
     try:
         email_datetime = email.utils.parsedate_to_datetime(_header_value(email_details, "Date"))
         return email_datetime if email_datetime.tzinfo else email_datetime.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError, IndexError):
+    except Exception:   # Any text can be in a Date header, e.g. a year too large for a number (OverflowError)
         return None
 
 
@@ -780,8 +785,8 @@ def _find_sent_emails(connection: IMAP4_SSL, threads_emails: list[list[dict]], s
     all_referenced_ids = set().union(*referenced_ids_per_thread) - all_own_ids
 
     sent_emails_per_thread = [[] for _ in threads_emails]
-    search_terms = [f"HEADER Message-ID {_imap_quote(message_id)}" for message_id in sorted(all_referenced_ids)]
-    for message_id in sorted(all_own_ids):
+    search_terms = [f"HEADER Message-ID {_imap_quote(message_id)}" for message_id in sorted(all_referenced_ids) if _searchable_message_id(message_id)]
+    for message_id in sorted(filter(_searchable_message_id, all_own_ids)):
         search_terms.append(f"HEADER References {_imap_quote(message_id)}")
         search_terms.append(f"HEADER In-Reply-To {_imap_quote(message_id)}")
     if not search_terms:
@@ -972,13 +977,14 @@ def get_thread_page(connection: IMAP4_SSL, folder_path: str, batch_size: int, pa
     )
 
     for index, thread in enumerate(page_threads):
-        if thread_summary := _thread_summary(
-            thread=thread,
-            email_details_by_uid=email_details_by_uid,
-            matched_uids=matched_uids,
-            sent_emails=sent_emails_per_thread[index] if sent_emails_per_thread else None,
-            sent_folder=sent_folder
-        ):
+        thread_details = {"thread": thread, "email_details_by_uid": email_details_by_uid, "matched_uids": matched_uids, "sent_folder": sent_folder}
+        try:
+            thread_summary = _thread_summary(sent_emails=sent_emails_per_thread[index] if sent_emails_per_thread else None, **thread_details)
+        except Exception as e:
+            # One malformed email must not fail the whole page: show the row without the Sent emails
+            logging.error(f"Failed to add the Sent emails to thread {thread[0]}: {e}", exc_info=True)
+            thread_summary = _thread_summary(**thread_details)
+        if thread_summary:
             result["threads"].append(thread_summary)
 
     return result
@@ -1073,14 +1079,17 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
         emails = []
 
         # Iterate through each response part
-        for response_part in data:
+        for part_index, response_part in enumerate(data):
             if isinstance(response_part, tuple):
                 try:
                     # Parse the email header
                     email_message = email.message_from_bytes(response_part[1])
-                    uid_match = re.search(r'\bUID (\d+)', response_part[0].decode())
+                    # What the server sends about the email: some servers send UID / FLAGS after the headers, in the next response part
+                    next_part = data[part_index + 1] if part_index + 1 < len(data) else None
+                    fetch_info = (response_part[0] + (next_part if isinstance(next_part, bytes) else b"")).decode(errors="replace")
+                    uid_match = re.search(r'\bUID (\d+)', fetch_info)
                     email_uid = uid_match.group(1) if uid_match else None
-                    email_id = response_part[0].decode().split()[0]  # Extract email ID from response
+                    email_id = fetch_info.split()[0]  # Extract email ID from response
                     if use_uid:
                         if email_uid is None:
                             raise ValueError(f"UID missing in FETCH response: {response_part[0]!r}")
@@ -1088,8 +1097,8 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
 
                     # Extract flags from the same response part
                     flags = []
-                    if 'FLAGS' in response_part[0].decode():
-                        flags = response_part[0].decode().split('FLAGS (')[1].split(')')[0].split()
+                    if 'FLAGS (' in fetch_info:
+                        flags = fetch_info.split('FLAGS (')[1].split(')')[0].split()
 
                     # Add both headers and flags to the email dictionary
                     email_details = dict(email_message._headers)
@@ -1101,7 +1110,7 @@ def get_email_details(connection: IMAP4_SSL, id_range: str, folder_path: str, fu
                     email_details = email_headers_cleanup(headers=email_details)
 
                     # Fall back to the arrival time if the email has no Date header
-                    internal_date = re.search(r'INTERNALDATE "([^"]+)"', response_part[0].decode())
+                    internal_date = re.search(r'INTERNALDATE "([^"]+)"', fetch_info)
                     email_details = _fill_missing_date(email_details, internal_date.group(1) if internal_date else None)
                     emails.append(email_details)
                 except Exception as e:
@@ -1249,7 +1258,13 @@ def _decode_part_content(content: bytes, encoding: str) -> bytes:
     if content is None:
         return b""
     if encoding == "base64":
-        return base64.b64decode(re.sub(rb"[^A-Za-z0-9+/=]", b"", content) + b"==", validate=False)
+        try:
+            return base64.b64decode(re.sub(rb"[^A-Za-z0-9+/=]", b"", content) + b"==", validate=False)
+        except ValueError:
+            # Damaged base64 (e.g. a cut off email): decode what is there instead of failing
+            data = re.sub(rb"[^A-Za-z0-9+/]", b"", content)
+            data = data[:-1] if len(data) % 4 == 1 else data
+            return base64.b64decode(data + b"=" * (-len(data) % 4))
     if encoding == "quoted-printable":
         return quopri.decodestring(content)
     return content
@@ -1926,6 +1941,11 @@ def bulk_email_action(connection: IMAP4_SSL, folder: str, action: str, max_uid: 
     return result
 
 
+def _search_text(value: str) -> str:
+    """Text typed by the user as a quoted IMAP string: a quote, a backslash or a line break can not change the command"""
+    return _imap_quote(re.sub(r"[\r\n]+", " ", value))
+
+
 def _build_search_criteria(query: dict) -> str:
     """
     Returns a single valid IMAP search criteria string (parenthesized).
@@ -1937,13 +1957,13 @@ def _build_search_criteria(query: dict) -> str:
     parts = []
 
     if "from" in query and query["from"]:
-        parts.append(f'FROM "{query["from"]}"')
+        parts.append(f'FROM {_search_text(query["from"])}')
 
     if "to" in query and query["to"]:
-        parts.append(f'TO "{query["to"]}"')
+        parts.append(f'TO {_search_text(query["to"])}')
 
     if "subject" in query and query["subject"]:
-        parts.append(f'SUBJECT "{query["subject"]}"')
+        parts.append(f'SUBJECT {_search_text(query["subject"])}')
 
     # size: IMAP supports LARGER n (size > n) and SMALLER n (size < n)
     if "size" in query and query["size"]:
