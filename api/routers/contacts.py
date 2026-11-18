@@ -35,7 +35,7 @@ from src.utils.base.libraries import (
     logging,
     status
 )
-from src.database import PostgresDep, AdminPostgresDep, create_contact, edit_contact, delete_contact, get_one_contact, get_contacts, contact_exists, simple_email_search, create_bulk_contacts, simple_email_search_v2
+from src.database import PostgresDep, create_contact, edit_contact, delete_contact, get_one_contact, get_contacts, contact_exists, simple_email_search, create_bulk_contacts, simple_email_search_v2
 from src.utils.models import Contact
 from src.main import CurrentUser
 
@@ -303,41 +303,5 @@ async def search_contacts(partial_email: str, user: CurrentUser, PgDB: PostgresD
         logging.error(f"Failed to search contacts: {str(e)}", exc_info=True)
         return JSONResponse(
             content={"message": f"Failed to search contacts: {str(e)}"},
-            status_code=status.HTTP_424_FAILED_DEPENDENCY
-        )
-
-
-# Simple Email Search for the drop down effect while typing the email (V2 DB Email Search)
-@router.get("/search/v2", response_class=JSONResponse, tags=["Contacts"], summary="Search for contacts by email (V2 DB Email Search)")
-async def search_contacts_v2(partial_email: str, user: CurrentUser, AdminPgDB: AdminPostgresDep) -> JSONResponse:
-    """Search for contacts by email (V2 DB Email Search)
-    :param partial_email: Partial email to search for
-    :param user: Current user
-    :param AdminPgDB: Admin Postgres database connection
-    :return: JSON response with the list of matching contacts
-    """
-    if not user.get("v2_domain_id"):
-        return JSONResponse(
-            content={"message": "User is not associated with any domain, cannot perform V2 contact search"},
-            status_code=status.HTTP_400_BAD_REQUEST
-        )
-
-    try:
-        logging.debug(f"Performing V2 contact search for user {user['user_email']} with partial email '{partial_email}' in domain ID {user['v2_domain_id']}")
-        contacts = await simple_email_search_v2(
-            admin_db_session=AdminPgDB,
-            domain_id=user["v2_domain_id"],
-            partial_email_string=partial_email
-        )
-
-        return JSONResponse(
-            content={"message": "V2 Contacts retrieved successfully", "contacts": contacts},
-            status_code=status.HTTP_200_OK
-        )
-
-    except Exception as e:
-        logging.error(f"Failed to search V2 contacts: {str(e)}", exc_info=True)
-        return JSONResponse(
-            content={"message": f"Failed to search V2 contacts: {str(e)}"},
             status_code=status.HTTP_424_FAILED_DEPENDENCY
         )

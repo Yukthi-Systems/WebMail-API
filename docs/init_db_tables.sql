@@ -76,3 +76,58 @@ CREATE INDEX IF NOT EXISTS idx_email_templates_name ON email_templates(name);
 
 -- Index on template_id for faster edits and deletes
 CREATE INDEX IF NOT EXISTS idx_email_templates_id ON email_templates(template_id);
+
+
+-- SQL schema for Yukthi WebMail API - With SSO
+
+
+-- Domain Details
+CREATE TABLE domains (
+    domain VARCHAR(255) PRIMARY KEY,
+    SMTP + IMAP + Sieve info,
+    is_active BOOLEAN DEFAULT TRUE,
+    is_external BOOLEAN DEFAULT FALSE   -- Means the domain is external to the service and should use the provided SMTP + IMAP info
+    -- Else, if not external, then use the details from SSO including IMAP/SMTP server and all that
+);
+
+
+-- Users
+CREATE TABLE users (
+    user_id UUID PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    domain VARCHAR(255) NOT NULL,
+
+    organization_id UUID NOT NULL,
+    organization_name VARCHAR(250) NOT NULL,
+
+    private_info JSONB NOT NULL,    -- Available only to the user themselves
+    public_info JSONB NOT NULL     -- Available to all within the organization
+);
+
+
+-- Contacts Table
+CREATE TABLE contacts (
+    contact_id SERIAL PRIMARY KEY,
+    organization_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+
+    -- Basic contact information
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+
+    -- Additional contact information
+    phone VARCHAR(20),
+    notes TEXT,
+
+    -- Indicates if the contact is shared within the organization
+    is_shared BOOLEAN DEFAULT FALSE,
+    
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+-- Templates
+CREATE TABLE email_templates (
+    ???
+);

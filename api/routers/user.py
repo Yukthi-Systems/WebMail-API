@@ -27,7 +27,6 @@ from src.utils.base.libraries import (
     orjson
 )
 from src.database import (
-    AdminPostgresDep,
     MemcachedDep,
     PostgresDep,
     get_v2_ids,
@@ -66,7 +65,7 @@ LOGIN_ERROR_MESSAGES = {
 
 # Login to WebMail - Validate IMAP and SMTP credentials (Create a session)
 @router.post("/login", response_class=JSONResponse, tags=["User"], summary="Login to WebMail")
-async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: MemcachedDep, PgDB: PostgresDep, AdminPgDB: AdminPostgresDep) -> JSONResponse:
+async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: MemcachedDep, PgDB: PostgresDep) -> JSONResponse:
     """
     Login to WebMail - Validate IMAP and SMTP credentials (Create a session)
     """
@@ -96,26 +95,26 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
     is_v2_user = server_details["is_v2_user"]
     v2_domain_id, v2_mailbox_id = None, None
 
-    if is_v2_user:
-        # Find the MailBox ID and Domain ID for the user from the DB (For V2 Users)
-        # Checked before the IP check, so a missing user is not reported as a blocked IP
-        v2_mailbox_id, v2_domain_id = await get_v2_ids(admin_db_session=AdminPgDB, user_email=data.email)
-        if not v2_domain_id or not v2_mailbox_id:
-            # Same message as a wrong password - do not reveal which email addresses exist
-            logging.warning(f"Login: user {data.email} not found in the V2 admin DB")
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={"message": LOGIN_ERROR_MESSAGES["wrong_credentials"]}
-            )
+    # if is_v2_user:
+    #     # Find the MailBox ID and Domain ID for the user from the DB (For V2 Users)
+    #     # Checked before the IP check, so a missing user is not reported as a blocked IP
+    #     v2_mailbox_id, v2_domain_id = await get_v2_ids(admin_db_session=AdminPgDB, user_email=data.email)
+    #     if not v2_domain_id or not v2_mailbox_id:
+    #         # Same message as a wrong password - do not reveal which email addresses exist
+    #         logging.warning(f"Login: user {data.email} not found in the V2 admin DB")
+    #         return JSONResponse(
+    #             status_code=status.HTTP_401_UNAUTHORIZED,
+    #             content={"message": LOGIN_ERROR_MESSAGES["wrong_credentials"]}
+    #         )
 
-        # Check if IP is blocked or not
-        ip_validation_result = await validate_origin_ip_blocked(admin_db_session=AdminPgDB, ip_address=request.headers.get('X-Real-IP'), user_email=data.email)
-        if not ip_validation_result:    # If it returns False, that means the IP is blocked
-            logging.warning(f"Login: access blocked for user {data.email} from IP {request.headers.get('X-Real-IP')}")
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content={"message": LOGIN_ERROR_MESSAGES["ip_blocked"]}
-            )
+    #     # Check if IP is blocked or not
+    #     ip_validation_result = await validate_origin_ip_blocked(admin_db_session=AdminPgDB, ip_address=request.headers.get('X-Real-IP'), user_email=data.email)
+    #     if not ip_validation_result:    # If it returns False, that means the IP is blocked
+    #         logging.warning(f"Login: access blocked for user {data.email} from IP {request.headers.get('X-Real-IP')}")
+    #         return JSONResponse(
+    #             status_code=status.HTTP_403_FORBIDDEN,
+    #             content={"message": LOGIN_ERROR_MESSAGES["ip_blocked"]}
+    #         )
 
     # Validate the IMAP details (SMTP is checked only if IMAP login works)
     imap_result = check_imap_login(

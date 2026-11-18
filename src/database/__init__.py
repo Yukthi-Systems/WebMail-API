@@ -18,7 +18,7 @@ All the Database related functions are defined here
 # <https://www.gnu.org/licenses/>.
 
 
-from .connections import PostgresDep, MemcachedDep, lifespan, AdminPostgresDep
+from .connections import PostgresDep, MemcachedDep, lifespan
 from .handler import (
     get_domain_details,
     create_user_session_in_cache,
@@ -80,7 +80,6 @@ __annotations__ = {
     "admin_get_all_domains": "Function to get all domains with pagination (Admin)",
     "admin_get_domain_info": "Function to get detailed information about a specific domain (Admin)",
     "create_bulk_contacts": "Function to create multiple contacts in the database (Skip if contact email already exists for the user)",
-    "AdminPostgresDep": "PostgreSQL connection dependency for FastAPI with admin privileges",
     "validate_origin_ip_blocked": "Function to check if the origin IP is blocked or not (Admin)",
     "get_v2_ids": "Function to get V2 Domain ID and Mailbox ID for a user based on their email address (For V2 Users)",
     "simple_email_search_v2": "Function to perform a simple email search in the database for V2 Users (Searches across all domains and mailboxes of the user)"
@@ -114,7 +113,6 @@ __all__ = [
     "admin_get_all_domains",
     "admin_get_domain_info",
     "create_bulk_contacts",
-    "AdminPostgresDep",
     "validate_origin_ip_blocked",
     "get_v2_ids",
     "simple_email_search_v2"

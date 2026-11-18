@@ -30,7 +30,7 @@ It includes the following components:
 
 
 from src.utils.base.libraries import Depends, status, asyncpg, aiomcache, logging, asynccontextmanager, Annotated, AsyncGenerator, Optional, FastAPI
-from src.utils.base.constants import POSTGRES_DB_URI, POSTGRES_POOL_SIZE, MEMCACHED_DB_HOST, MEMCACHED_DB_PORT, MEMCACHED_DB_POOL_SIZE, ADMIN_POSTGRES_DB_URI, ADMIN_POSTGRES_POOL_SIZE, POSTGRES_POOL_MAX_INACTIVE_CONNECTION_LIFETIME
+from src.utils.base.constants import POSTGRES_DB_URI, POSTGRES_POOL_SIZE, MEMCACHED_DB_HOST, MEMCACHED_DB_PORT, MEMCACHED_DB_POOL_SIZE, POSTGRES_POOL_MAX_INACTIVE_CONNECTION_LIFETIME
 from src.utils.models import All_Exceptions
 
 
@@ -90,64 +90,6 @@ async def get_db() -> AsyncGenerator[asyncpg.Connection, None]:
 
 
 PostgresDep = Annotated[asyncpg.Connection, Depends(get_db)]
-
-
-# ======= PostgreSQL V2 Admin DB Connection =======
-
-
-class AdminDatabase:
-    """PostgreSQL Admin V2 database connection pool manager"""
-    def __init__(self):
-        """Initialize the PostgreSQL Admin V2 database connection pool"""
-        self.pool = None
-
-    async def create_pool(self):
-        """Create connection pool if it doesn't exist"""
-        if self.pool is None:
-            try:
-                self.pool = await asyncpg.create_pool(
-                    ADMIN_POSTGRES_DB_URI,
-                    min_size=int(ADMIN_POSTGRES_POOL_SIZE / 2),
-                    max_size=ADMIN_POSTGRES_POOL_SIZE,
-                    max_inactive_connection_lifetime=300   # 5 minutes
-                )
-                logging.debug("PostgreSQL admin connection pool created successfully")
-
-            except asyncpg.exceptions.PostgresError as e:
-                logging.error(f"Error creating PostgreSQL admin connection pool: {e}")
-                raise ValueError("Failed to create PostgreSQL admin connection pool")
-
-            except Exception as e:
-                logging.error(f"Unexpected error while creating PostgreSQL admin connection pool: {e}", exc_info=True)
-                raise
-
-    @asynccontextmanager
-    async def get_connection(self) -> AsyncGenerator[asyncpg.Connection, None]:
-        """Get database connection from pool"""
-        if not self.pool:
-            await self.create_pool()
-        async with self.pool.acquire() as connection:
-            logging.info("Pool of connections acquired for PostgreSQL admin DB successfully")
-            yield connection
-            logging.info("Connection released back to the pool")
-
-    async def close(self):
-        """Close the pool when shutting down"""
-        if self.pool:
-            await self.pool.close()
-            logging.debug("PostgreSQL admin connection pool closed successfully")
-            self.pool = None
-
-
-AdminDB = AdminDatabase()
-
-
-async def get_admin_db() -> AsyncGenerator[asyncpg.Connection, None]:
-    async with AdminDB.get_connection() as conn:
-        yield conn
-
-
-AdminPostgresDep = Annotated[asyncpg.Connection, Depends(get_admin_db)]
 
 
 # ======= Memcached DB Connection =======
@@ -213,11 +155,6 @@ async def lifespan(app: FastAPI):
         await db.create_pool()
         logging.info("PostgreSQL Db pool created successfully")
 
-        # Initialize PostgreSQL Admin connection pool
-        logging.debug("Beginning to create PostgreSQL admin pool")
-        await AdminDB.create_pool()
-        logging.info("PostgreSQL Admin Db pool created successfully")
-
         # Initialize Memcached connection pool
         logging.debug("Beginning to create Memcached pool")
         await MemcachedClient.initialize()
@@ -233,6 +170,5 @@ async def lifespan(app: FastAPI):
         # Shutdown: close all connections
         logging.debug("Shutting down all database connections")
         await db.close()
-        await AdminDB.close()
         await MemcachedClient.close()
         logging.info("All database connections closed successfully")
