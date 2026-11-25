@@ -164,6 +164,10 @@ async def get_current_user_session_details(request: Request, CacheDB: MemcachedD
     if user_data["csrf_token"] != csrf_token:
         raise All_Exceptions(message="CSRF token mismatch", status_code=status.HTTP_401_UNAUTHORIZED)
 
+    # A session from before the new database schema has no user_id: log in again
+    if not user_data.get("user_id"):
+        raise All_Exceptions(message="Session expired", status_code=status.HTTP_401_UNAUTHORIZED)
+
     return user_data
 
 
