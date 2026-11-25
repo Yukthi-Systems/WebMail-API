@@ -35,7 +35,7 @@ from src.utils.base.libraries import (
     logging,
     status
 )
-from src.database import PostgresDep, create_contact, edit_contact, delete_contact, get_one_contact, get_contacts, contact_exists, simple_email_search, create_bulk_contacts, simple_email_search_v2
+from src.database import PostgresDep, create_contact, edit_contact, delete_contact, get_one_contact, get_contacts, contact_exists, simple_email_search, create_bulk_contacts
 from src.utils.models import Contact
 from src.main import CurrentUser
 
@@ -56,7 +56,8 @@ async def create_new_contact(data: Contact, user: CurrentUser, PgDB: PostgresDep
     try:
         await create_contact(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
+            organization_id=user["organization_id"],
             contact_email=data.email,
             contact_name=data.name,
             contact_phone=data.phone,
@@ -88,7 +89,7 @@ async def edit_single_contact(contact_id: int, data: Contact, user: CurrentUser,
     try:
         await edit_contact(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
             contact_id=contact_id,
             contact_email=data.email,
             contact_name=data.name,
@@ -121,7 +122,7 @@ async def delete_single_contact(contact_id: int, user: CurrentUser, PgDB: Postgr
     try:
         await delete_contact(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
             contact_id=contact_id
         )
 
@@ -149,7 +150,8 @@ async def bulk_add_contacts(data: list[Contact], user: CurrentUser, PgDB: Postgr
     try:
         await create_bulk_contacts(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
+            organization_id=user["organization_id"],
             contacts=[{
                 "contact_email": contact.email,
                 "contact_name": contact.name,
@@ -184,7 +186,7 @@ async def bulk_delete_contacts(data: list[int], user: CurrentUser, PgDB: Postgre
         for contact_id in data:
             await delete_contact(
                 db_session=PgDB,
-                user_email=user["user_email"],
+                user_id=user["user_id"],
                 contact_id=contact_id
             )
 
@@ -213,7 +215,7 @@ async def get_single_contact(contact_id: int, user: CurrentUser, PgDB: PostgresD
         contact = await get_one_contact(
             db_session=PgDB,
             contact_id=contact_id,
-            user_email=user["user_email"]
+            user_id=user["user_id"]
         )
 
         return JSONResponse(
@@ -238,7 +240,7 @@ async def get_all_contacts(page: int, page_size: int, user: CurrentUser, PgDB: P
     """
     contacts = await get_contacts(
         db_session=PgDB,
-        user_email=user["user_email"],
+        user_id=user["user_id"],
         current_page=page,
         page_size=page_size
     )
@@ -261,7 +263,7 @@ async def check_contact_exists(email: str, user: CurrentUser, PgDB: PostgresDep)
     try:
         exists = await contact_exists(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
             contact_email=email
         )
 
@@ -290,7 +292,7 @@ async def search_contacts(partial_email: str, user: CurrentUser, PgDB: PostgresD
     try:
         contacts = await simple_email_search(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
             partial_email_string=partial_email
         )
 

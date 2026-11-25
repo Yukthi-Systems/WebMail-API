@@ -924,7 +924,8 @@ async def fetch_all_email_templates(is_public: bool, user: CurrentUser, PgDB: Po
         templates = await get_all_templates(
             db_session=PgDB,
             is_public=is_public,
-            user_email=user["user_email"]
+            user_id=user["user_id"],
+            organization_id=user["organization_id"]
         )
         return JSONResponse(
             content={
@@ -952,7 +953,8 @@ async def fetch_email_template(template_id: int, user: CurrentUser, PgDB: Postgr
         template = await get_template(
             db_session=PgDB,
             template_id=template_id,
-            user_email=user["user_email"]
+            user_id=user["user_id"],
+            organization_id=user["organization_id"]
         )
         return JSONResponse(
             content={
@@ -978,7 +980,9 @@ async def create_email_template(template_data: EmailTemplate, user: CurrentUser,
     try:
         await create_template(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
+            organization_id=user["organization_id"],
+            user_domain=user["user_email"].rsplit("@", 1)[-1].lower(),
             is_public=template_data.is_public,
             data={
                 "name": template_data.name,
@@ -991,6 +995,9 @@ async def create_email_template(template_data: EmailTemplate, user: CurrentUser,
             content={"message": "Email template created successfully"},
             status_code=status.HTTP_201_CREATED
         )
+
+    except All_Exceptions:
+        raise
 
     except Exception as e:
         return JSONResponse(
@@ -1008,7 +1015,7 @@ async def delete_email_template(template_id: int, user: CurrentUser, PgDB: Postg
     try:
         await delete_template(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
             template_id=template_id
         )
         return JSONResponse(
@@ -1032,7 +1039,7 @@ async def edit_email_template(template_id: int, template_data: EmailTemplate, us
     try:
         await edit_template(
             db_session=PgDB,
-            user_email=user["user_email"],
+            user_id=user["user_id"],
             template_id=template_id,
             is_public=template_data.is_public,
             data={
@@ -1046,6 +1053,9 @@ async def edit_email_template(template_id: int, template_data: EmailTemplate, us
             content={"message": "Email template updated successfully"},
             status_code=status.HTTP_200_OK
         )
+
+    except All_Exceptions:
+        raise
 
     except Exception as e:
         return JSONResponse(

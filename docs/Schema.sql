@@ -87,3 +87,11 @@ CREATE TABLE email_templates (
 
     UNIQUE (user_id, name)
 );
+
+
+-- Indexes 
+CREATE INDEX idx_users_domain ON users (domain);
+CREATE INDEX idx_domains_mail_server_config ON domains (mail_server_config_id);
+CREATE INDEX idx_contacts_user_created ON contacts (user_id, created_at DESC);
+CREATE INDEX idx_templates_user_updated ON email_templates (user_id, updated_at DESC);
+CREATE INDEX idx_templates_org_public ON email_templates (organization_id, updated_at DESC) WHERE is_public;

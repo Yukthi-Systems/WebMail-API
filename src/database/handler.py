@@ -18,7 +18,7 @@ Handles all the database operations
 # <https://www.gnu.org/licenses/>.
 
 
-from src.utils.base.libraries import aiomcache, asyncpg, TypeAlias, logging, status, uuid, orjson
+from src.utils.base.libraries import aiomcache, asyncpg, TypeAlias, Optional, logging, status, uuid, orjson
 from src.utils.base.constants import MAX_AGE_OF_CACHE, PRE_DEFINED_SETTINGS
 from src.utils.models import All_Exceptions
 
@@ -27,32 +27,55 @@ PgSession: TypeAlias = asyncpg.Connection
 MemCacheSession: TypeAlias = aiomcache.Client
 
 
+
+# everyone on the same domain shares one organization. The id is derived from the domain, so it is
+# the same on every login without storing it anywhere, and organization_name is the domain.
+EXTERNAL_ORGANIZATION_NAMESPACE = uuid.UUID("3b2f6a58-4f0e-4c8e-9a51-6f3c2d8e7b10")
+
+
+def external_organization_id(domain: str) -> uuid.UUID:
+    """Organization id of an external domain (the same for every user of that domain)"""
+    return uuid.uuid5(EXTERNAL_ORGANIZATION_NAMESPACE, domain.lower())
+
+
+def _ts(value) -> Optional[str]:
+    return str(value) if value is not None else None
+
+
 async def get_domain_details(db_session: PgSession, domain: str) -> dict:
     """
-    Get domain details from the database
+    Get the domain and its mail server from the database. Empty dict if the domain is not registered.
+    mail_server_config_id is None for an internal domain (no mail server configuration, its users log in with SSO).
     """
     try:
         row = await db_session.fetchrow(
             """
-            SELECT smtp_server, smtp_port, imap_server, is_v2_user,
-            imap_port, sieve_server, sieve_port, is_active
-            FROM domain_details WHERE domain = $1
+            SELECT d.is_active, d.mail_server_config_id,
+                   c.server_host, c.smtp_port, c.imap_port, c.sieve_port
+            FROM domains d
+            LEFT JOIN mail_server_config c ON c.config_id = d.mail_server_config_id
+            WHERE d.domain = $1
             """,
             domain
         )
-        if row:
-            return {
-                "smtp_server": row["smtp_server"],
-                "smtp_port": row["smtp_port"],
-                "imap_server": row["imap_server"],
-                "imap_port": row["imap_port"],
-                "sieve_server": row["sieve_server"],
-                "sieve_port": row["sieve_port"],
-                "is_active": row["is_active"],
-                "is_v2_user": row["is_v2_user"]
-            }
-        else:
+        if not row:
             return {}
+
+        details = {
+            "is_active": row["is_active"],
+            "mail_server_config_id": row["mail_server_config_id"]
+        }
+        if row["mail_server_config_id"] is not None:
+            # One host serves IMAP, SMTP and Sieve
+            details.update({
+                "smtp_server": row["server_host"],
+                "smtp_port": row["smtp_port"],
+                "imap_server": row["server_host"],
+                "imap_port": row["imap_port"],
+                "sieve_server": row["server_host"],
+                "sieve_port": row["sieve_port"]
+            })
+        return details
 
     except Exception as e:
         logging.error(f"Error fetching domain details: {e}", exc_info=True)
@@ -67,7 +90,7 @@ async def create_user_session_in_cache(
     smtp_server: str, smtp_port: int, smtp_user: str, smtp_password: str,
     imap_server: str, imap_port: int, imap_user: str, imap_password: str,
     sieve_server: str, sieve_port: int, sieve_user: str, sieve_password: str,
-    v2_mailbox_id: int = None, v2_domain_id: int = None
+    user_id: str, organization_id: str, organization_name: str
 ) -> tuple[str, str]:
     """
     Create a user session in the cache and return the session ID and CSRF token
@@ -85,9 +108,10 @@ async def create_user_session_in_cache(
                 "user_email": user_email,
                 "raw_password": raw_password,
 
-                # V2 Admin Details
-                "v2_mailbox_id": v2_mailbox_id,
-                "v2_domain_id": v2_domain_id,
+                # User in the database
+                "user_id": str(user_id),
+                "organization_id": str(organization_id),
+                "organization_name": organization_name,
 
                 # SMTP details
                 "smtp_server": smtp_server,
@@ -122,21 +146,18 @@ async def create_user_session_in_cache(
         )
 
 
-async def get_user_settings(db_session: PgSession, user_email: str) -> dict:
+async def get_user_settings(db_session: PgSession, user_id: str) -> dict:
     """
-    Get user settings from the database based on the user email
+    Get user settings from the database (private_info -> settings)
     """
     try:
-        row = await db_session.fetchrow(
+        settings = await db_session.fetchval(
             """
-            SELECT settings FROM users WHERE email = $1
+            SELECT private_info -> 'settings' FROM users WHERE user_id = $1
             """,
-            user_email
+            uuid.UUID(str(user_id))
         )
-        if row:
-            return orjson.loads(row["settings"].encode("utf-8"))
-        else:
-            return {}
+        return orjson.loads(settings) if settings else {}
 
     except Exception as e:
         logging.error(f"Error while fetching user settings: {e}", exc_info=True)
@@ -146,18 +167,20 @@ async def get_user_settings(db_session: PgSession, user_email: str) -> dict:
         )
 
 
-async def replace_user_settings(db_session: PgSession, user_email: str, settings: dict) -> None:
+async def replace_user_settings(db_session: PgSession, user_id: str, settings: dict) -> None:
     """
     Update user settings in the database
-    Replaces the existing settings with the new settings
+    Replaces the existing settings with the new settings (the rest of private_info is kept)
     """
     try:
         await db_session.execute(
             """
-            UPDATE users SET settings = $1 WHERE email = $2
+            UPDATE users
+            SET private_info = jsonb_set(private_info, '{settings}', $1::jsonb, true)
+            WHERE user_id = $2
             """,
             orjson.dumps(settings).decode("utf-8"),
-            user_email
+            uuid.UUID(str(user_id))
         )
 
     except Exception as e:
@@ -168,24 +191,38 @@ async def replace_user_settings(db_session: PgSession, user_email: str, settings
         )
 
 
-async def create_user_if_not_exists(db_session: PgSession, user_email: str, user_domain: str) -> None:
+async def get_or_create_user(db_session: PgSession, user_email: str, user_domain: str) -> dict:
     """
-    Create a user in the database if it does not exist
+    Get the user by email, or create it (random user_id, the default settings) on the first login.
+    Users of external domains share one organization per domain (see external_organization_id).
+    Returns user_id, organization_id and organization_name.
     """
     try:
-        await db_session.execute(
+        row = await db_session.fetchrow(
             """
-            INSERT INTO users (email, domain, settings)
-            SELECT $1, $2::VARCHAR, $3::TEXT
-            WHERE EXISTS (
-                SELECT 1 FROM domain_details WHERE domain = $2::VARCHAR
+            WITH new_user AS (
+                INSERT INTO users (user_id, email, domain, organization_id, organization_name, private_info, public_info)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb)
+                ON CONFLICT (email) DO NOTHING
+                RETURNING user_id, organization_id, organization_name
             )
-            ON CONFLICT (email) DO NOTHING
+            SELECT user_id, organization_id, organization_name FROM new_user
+            UNION ALL
+            SELECT user_id, organization_id, organization_name FROM users WHERE email = $2
+            LIMIT 1
             """,
+            uuid.uuid4(),
             user_email,
             user_domain,
-            orjson.dumps(PRE_DEFINED_SETTINGS).decode("utf-8")
+            external_organization_id(user_domain),
+            user_domain,
+            orjson.dumps({"settings": PRE_DEFINED_SETTINGS}).decode("utf-8")
         )
+        return {
+            "user_id": str(row["user_id"]),
+            "organization_id": str(row["organization_id"]),
+            "organization_name": row["organization_name"]
+        }
 
     except Exception as e:
         logging.error(f"Error while creating user: {e}", exc_info=True)
@@ -195,20 +232,39 @@ async def create_user_if_not_exists(db_session: PgSession, user_email: str, user
         )
 
 
-async def create_contact(db_session: PgSession, user_email: str, contact_name: str, contact_email: str, contact_phone: str='', contact_notes: str='') -> None:
+async def delete_user(db_session: PgSession, user_id: str) -> None:
+    """Delete a user. Their contacts and templates are deleted with them (ON DELETE CASCADE)."""
+    await db_session.execute("DELETE FROM users WHERE user_id = $1", uuid.UUID(str(user_id)))
+
+
+def _contact_row(row) -> dict:
+    # modified_at is the old name of updated_at, kept for the API clients
+    return {
+        "contact_id": row["contact_id"],
+        "name": row["name"],
+        "email": row["email"],
+        "phone": row["phone"],
+        "notes": row["notes"],
+        "created_at": _ts(row["created_at"]),
+        "modified_at": _ts(row["updated_at"])
+    }
+
+
+async def create_contact(db_session: PgSession, user_id: str, organization_id: str, contact_name: str, contact_email: str, contact_phone: str='', contact_notes: str='') -> None:
     """
     Create a new contact in the database
     """
     try:
         await db_session.execute(
             """
-            INSERT INTO user_contacts (
-                user_email, name, email, phone, notes
+            INSERT INTO contacts (
+                user_id, organization_id, name, email, phone, notes
             ) VALUES (
-                $1, $2, $3, $4, $5
+                $1, $2, $3, $4, $5, $6
             )
             """,
-            user_email,
+            uuid.UUID(str(user_id)),
+            uuid.UUID(str(organization_id)),
             contact_name,
             contact_email,
             contact_phone,
@@ -223,31 +279,31 @@ async def create_contact(db_session: PgSession, user_email: str, contact_name: s
         )
 
 
-async def create_bulk_contacts(db_session: PgSession, user_email: str, contacts: list[dict]) -> None:
+async def create_bulk_contacts(db_session: PgSession, user_id: str, organization_id: str, contacts: list[dict]) -> None:
     """
     Create multiple contacts in the database (Skip if contact email already exists for the user)
     """
     try:
-        values = []
-        for contact in contacts:
-            values.append((
-                user_email,
-                contact["contact_name"],
-                contact["contact_email"],
-                contact["contact_phone"],
-                contact["contact_notes"]
-            ))
-
         await db_session.executemany(
             """
-            INSERT INTO user_contacts (
-                user_email, name, email, phone, notes
+            INSERT INTO contacts (
+                user_id, organization_id, name, email, phone, notes
             ) VALUES (
-                $1, $2, $3, $4, $5
+                $1, $2, $3, $4, $5, $6
             )
-            ON CONFLICT (user_email, email) DO NOTHING
+            ON CONFLICT (user_id, email) DO NOTHING
             """,
-            values
+            [
+                (
+                    uuid.UUID(str(user_id)),
+                    uuid.UUID(str(organization_id)),
+                    contact["contact_name"],
+                    contact["contact_email"],
+                    contact["contact_phone"],
+                    contact["contact_notes"]
+                )
+                for contact in contacts
+            ]
         )
 
     except Exception as e:
@@ -258,23 +314,23 @@ async def create_bulk_contacts(db_session: PgSession, user_email: str, contacts:
         )
 
 
-async def edit_contact(db_session: PgSession, contact_id: int, user_email: str, contact_name: str, contact_email: str, contact_phone: str='', contact_notes: str='') -> None:
+async def edit_contact(db_session: PgSession, contact_id: int, user_id: str, contact_name: str, contact_email: str, contact_phone: str='', contact_notes: str='') -> None:
     """
     Edit an existing contact in the database
     """
     try:
         await db_session.execute(
             """
-            UPDATE user_contacts
-            SET name = $2, email = $3, phone = $4, notes = $5, modified_at = NOW()
-            WHERE contact_id = $1 AND user_email = $6
+            UPDATE contacts
+            SET name = $2, email = $3, phone = $4, notes = $5, updated_at = NOW()
+            WHERE contact_id = $1 AND user_id = $6
             """,
             contact_id,
             contact_name,
             contact_email,
             contact_phone,
             contact_notes,
-            user_email
+            uuid.UUID(str(user_id))
         )
 
     except Exception as e:
@@ -285,18 +341,18 @@ async def edit_contact(db_session: PgSession, contact_id: int, user_email: str, 
         )
 
 
-async def delete_contact(db_session: PgSession, contact_id: int, user_email: str) -> None:
+async def delete_contact(db_session: PgSession, contact_id: int, user_id: str) -> None:
     """
     Delete a contact from the database
     """
     try:
         await db_session.execute(
             """
-            DELETE FROM user_contacts
-            WHERE contact_id = $1 AND user_email = $2
+            DELETE FROM contacts
+            WHERE contact_id = $1 AND user_id = $2
             """,
             contact_id,
-            user_email
+            uuid.UUID(str(user_id))
         )
 
     except Exception as e:
@@ -307,30 +363,22 @@ async def delete_contact(db_session: PgSession, contact_id: int, user_email: str
         )
 
 
-async def get_one_contact(db_session: PgSession, contact_id: int, user_email: str) -> dict:
+async def get_one_contact(db_session: PgSession, contact_id: int, user_id: str) -> dict:
     """
     Get a single contact from the database
     """
     try:
         row = await db_session.fetchrow(
             """
-            SELECT contact_id, name, email, phone, notes, created_at, modified_at
-            FROM user_contacts
-            WHERE contact_id = $1 AND user_email = $2
+            SELECT contact_id, name, email, phone, notes, created_at, updated_at
+            FROM contacts
+            WHERE contact_id = $1 AND user_id = $2
             """,
             contact_id,
-            user_email
+            uuid.UUID(str(user_id))
         )
         if row:
-            return {
-                "contact_id": row["contact_id"],
-                "name": row["name"],
-                "email": row["email"],
-                "phone": row["phone"],
-                "notes": row["notes"],
-                "created_at": str(row["created_at"]),
-                "modified_at": str(row["modified_at"])
-            }
+            return _contact_row(row)
 
         raise All_Exceptions(
             message="Contact not found",
@@ -345,16 +393,17 @@ async def get_one_contact(db_session: PgSession, contact_id: int, user_email: st
         )
 
 
-async def get_contacts(db_session: PgSession, user_email: str, current_page: int, page_size: int=10) -> list[dict]:
+async def get_contacts(db_session: PgSession, user_id: str, current_page: int, page_size: int=10) -> list[dict]:
     """
     Get a list of contacts from the database
     """
+    user_id = uuid.UUID(str(user_id))
     total_count = await db_session.fetchval(
         """
-        SELECT COUNT(*) FROM user_contacts
-        WHERE user_email = $1
+        SELECT COUNT(*) FROM contacts
+        WHERE user_id = $1
         """,
-        user_email
+        user_id
     )
 
     if (total_count is None) or (total_count == 0):
@@ -393,16 +442,16 @@ async def get_contacts(db_session: PgSession, user_email: str, current_page: int
         )
 
     # Calculate the offset for pagination
-    offset = (current_page - 1) * page_size        
+    offset = (current_page - 1) * page_size
     rows = await db_session.fetch(
         """
-        SELECT contact_id, name, email, phone, notes, created_at, modified_at
-        FROM user_contacts
-        WHERE user_email = $1
+        SELECT contact_id, name, email, phone, notes, created_at, updated_at
+        FROM contacts
+        WHERE user_id = $1
         ORDER BY created_at DESC
         LIMIT $2 OFFSET $3
         """,
-        user_email,
+        user_id,
         page_size,
         offset
     )
@@ -419,37 +468,26 @@ async def get_contacts(db_session: PgSession, user_email: str, current_page: int
         "first_page": 1,
         "last_page": (total_count + page_size - 1) // page_size,
         "page_number": current_page,
-        "data": [
-            {
-                "contact_id": row["contact_id"],
-                "name": row["name"],
-                "email": row["email"],
-                "phone": row["phone"],
-                "notes": row["notes"],
-                "created_at": str(row["created_at"]),
-                "modified_at": str(row["modified_at"])
-            }
-            for row in rows
-        ]
+        "data": [_contact_row(row) for row in rows]
     }
 
 
-async def contact_exists(db_session: PgSession, user_email: str, contact_email: str) -> bool:
+async def contact_exists(db_session: PgSession, user_id: str, contact_email: str) -> bool:
     """
     Check if a contact exists in the database
     """
     row = await db_session.fetchrow(
         """
-        SELECT 1 FROM user_contacts
-        WHERE user_email = $1 AND email = $2
+        SELECT 1 FROM contacts
+        WHERE user_id = $1 AND email = $2
         """,
-        user_email,
+        uuid.UUID(str(user_id)),
         contact_email
     )
     return row is not None
 
 
-async def simple_email_search(db_session: PgSession, user_email: str, partial_email_string: str) -> list[dict]:
+async def simple_email_search(db_session: PgSession, user_id: str, partial_email_string: str) -> list[dict]:
     """
     Search for contacts by a partial email string
     Used for the drop down effect while typing the email
@@ -457,12 +495,12 @@ async def simple_email_search(db_session: PgSession, user_email: str, partial_em
     rows = await db_session.fetch(
         """
         SELECT contact_id, name, email
-        FROM user_contacts
-        WHERE user_email = $1 AND email ILIKE $2
+        FROM contacts
+        WHERE user_id = $1 AND email ILIKE $2
         ORDER BY created_at DESC
         LIMIT 25
         """,
-        user_email,
+        uuid.UUID(str(user_id)),
         f"%{partial_email_string}%"
     )
     if not rows:
@@ -478,81 +516,80 @@ async def simple_email_search(db_session: PgSession, user_email: str, partial_em
     ]
 
 
-async def get_all_templates(db_session: PgSession, user_email: str, is_public: bool) -> list[dict]:
+async def get_all_templates(db_session: PgSession, user_id: str, organization_id: str, is_public: bool) -> list[dict]:
     """
-    Get the templates for a user (based on domain if its public)
+    Get the templates of a user, or the public templates of their organization.
+    created_by is the email of the user who made the template, modified_at is updated_at (names kept for the API clients).
     """
     if is_public:
-        user_domain = user_email.split("@")[-1]
-
+        # Filtered on the organization of the template itself, no join needed for the filter
         rows = await db_session.fetch(
             """
-            SELECT template_id, name, created_by, created_at, modified_at
-            FROM email_templates
-            WHERE is_public = TRUE AND domain = $1
-            ORDER BY modified_at DESC
+            SELECT t.template_id, t.name, u.email AS created_by, t.created_at, t.updated_at
+            FROM email_templates t
+            JOIN users u ON u.user_id = t.user_id
+            WHERE t.is_public = TRUE AND t.organization_id = $1
+            ORDER BY t.updated_at DESC
             """,
-            user_domain
+            uuid.UUID(str(organization_id))
         )
-        if not rows:
-            return []
-
         return [
             {
                 "template_id": row["template_id"],
                 "name": row["name"],
                 "created_by": row["created_by"],
-                "created_at": str(row["created_at"]),
-                "modified_at": str(row["modified_at"])
+                "created_at": _ts(row["created_at"]),
+                "modified_at": _ts(row["updated_at"])
             }
             for row in rows
         ]
 
     # If user wants to see their own templates
-    else:
-        rows = await db_session.fetch(
-            """
-            SELECT template_id, name, created_at, modified_at
-            FROM email_templates
-            WHERE created_by = $1
-            ORDER BY modified_at DESC
-            """,
-            user_email
-        )
-        if not rows:
-            return []
-
-        return [
-            {
-                "template_id": row["template_id"],
-                "name": row["name"],
-                "created_at": str(row["created_at"]),
-                "modified_at": str(row["modified_at"])
-            }
-            for row in rows
-        ]
+    rows = await db_session.fetch(
+        """
+        SELECT template_id, name, created_at, updated_at
+        FROM email_templates
+        WHERE user_id = $1
+        ORDER BY updated_at DESC
+        """,
+        uuid.UUID(str(user_id))
+    )
+    return [
+        {
+            "template_id": row["template_id"],
+            "name": row["name"],
+            "created_at": _ts(row["created_at"]),
+            "modified_at": _ts(row["updated_at"])
+        }
+        for row in rows
+    ]
 
 
-async def create_template(db_session: PgSession, user_email: str, is_public: bool, data: dict) -> None:
+async def create_template(db_session: PgSession, user_id: str, organization_id: str, user_domain: str, is_public: bool, data: dict) -> None:
     """
     Create a new email template
     """
-    user_domain = user_email.split("@")[-1]
-
     try:
         await db_session.execute(
             """
             INSERT INTO email_templates (
-                domain, created_by, name, is_public, data
+                domain, user_id, organization_id, name, is_public, details
             ) VALUES (
-                $1, $2, $3, $4, $5
+                $1, $2, $3, $4, $5, $6::jsonb
             )
             """,
             user_domain,
-            user_email,
+            uuid.UUID(str(user_id)),
+            uuid.UUID(str(organization_id)),
             data["name"],
             is_public,
             orjson.dumps(data).decode("utf-8")
+        )
+
+    except asyncpg.UniqueViolationError:
+        raise All_Exceptions(
+            message=f"You already have a template named {data['name']!r}",
+            status_code=status.HTTP_409_CONFLICT
         )
 
     except Exception as e:
@@ -563,7 +600,7 @@ async def create_template(db_session: PgSession, user_email: str, is_public: boo
         )
 
 
-async def delete_template(db_session: PgSession, user_email: str, template_id: int) -> None:
+async def delete_template(db_session: PgSession, user_id: str, template_id: int) -> None:
     """
     Delete an email template
     """
@@ -571,10 +608,10 @@ async def delete_template(db_session: PgSession, user_email: str, template_id: i
         await db_session.execute(
             """
             DELETE FROM email_templates
-            WHERE template_id = $1 AND created_by = $2
+            WHERE template_id = $1 AND user_id = $2
             """,
             template_id,
-            user_email
+            uuid.UUID(str(user_id))
         )
 
     except Exception as e:
@@ -585,7 +622,7 @@ async def delete_template(db_session: PgSession, user_email: str, template_id: i
         )
 
 
-async def edit_template(db_session: PgSession, template_id: int, user_email: str, is_public: bool, data: dict) -> None:
+async def edit_template(db_session: PgSession, template_id: int, user_id: str, is_public: bool, data: dict) -> None:
     """
     Edit means just replacing all the data but keeping the id, thats it
     """
@@ -593,14 +630,20 @@ async def edit_template(db_session: PgSession, template_id: int, user_email: str
         await db_session.execute(
             """
             UPDATE email_templates
-            SET name = $1, is_public = $2, data = $3
-            WHERE template_id = $4 AND created_by = $5
+            SET name = $1, is_public = $2, details = $3::jsonb, updated_at = NOW()
+            WHERE template_id = $4 AND user_id = $5
             """,
             data["name"],
             is_public,
             orjson.dumps(data).decode("utf-8"),
             template_id,
-            user_email
+            uuid.UUID(str(user_id))
+        )
+
+    except asyncpg.UniqueViolationError:
+        raise All_Exceptions(
+            message=f"You already have a template named {data['name']!r}",
+            status_code=status.HTTP_409_CONFLICT
         )
 
     except Exception as e:
@@ -611,110 +654,95 @@ async def edit_template(db_session: PgSession, template_id: int, user_email: str
         )
 
 
-async def get_template(db_session: PgSession, template_id: int, user_email: str) -> dict:
+async def get_template(db_session: PgSession, template_id: int, user_id: str, organization_id: str) -> dict:
     """
-    Get an email template by ID
+    Get an email template by ID: your own, or a public one of your organization. Empty dict otherwise.
     """
-    # If user is trying to fetch public template and is of same domain all ok
-    user_domain = user_email.split("@")[-1]
     row = await db_session.fetchrow(
         """
-        SELECT created_by, is_public, domain
-        FROM email_templates
-        WHERE template_id = $1
+        SELECT t.template_id, t.name, u.email AS created_by, t.is_public, t.details, t.created_at, t.updated_at
+        FROM email_templates t
+        JOIN users u ON u.user_id = t.user_id
+        WHERE t.template_id = $1
+          AND (t.user_id = $2 OR (t.is_public AND t.organization_id = $3))
         """,
-        template_id
+        template_id,
+        uuid.UUID(str(user_id)),
+        uuid.UUID(str(organization_id))
     )
     if not row:
         return {}
 
-    # if user is same then all ok
-    if row["created_by"] == user_email:
-        template_row = await db_session.fetchrow(
-            """
-            SELECT template_id, name, created_by, is_public, data, created_at, modified_at
-            FROM email_templates
-            WHERE template_id = $1
-            """,
-            template_id
+    return {
+        "template_id": row["template_id"],
+        "name": row["name"],
+        "created_by": row["created_by"],
+        "is_public": row["is_public"],
+        "data": orjson.loads(row["details"]),
+        "created_at": _ts(row["created_at"]),
+        "modified_at": _ts(row["updated_at"])
+    }
+
+
+def _admin_mail_server(server_host: Optional[str], smtp_server: Optional[str], imap_server: Optional[str], sieve_server: Optional[str]) -> Optional[str]:
+    """
+    The one host of a mail server configuration. Accepts the old form (smtp_server / imap_server / sieve_server)
+    as long as they are the same host. None if no host is given.
+    """
+    hosts = {host.strip().lower() for host in (server_host, smtp_server, imap_server, sieve_server) if host and host.strip()}
+    if len(hosts) > 1:
+        raise All_Exceptions(
+            message="IMAP, SMTP and Sieve must use the same server host",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
         )
-        if not template_row:
-            return {}
+    return hosts.pop() if hosts else None
 
-        return {
-            "template_id": template_row["template_id"],
-            "name": template_row["name"],
-            "created_by": template_row["created_by"],
-            "is_public": template_row["is_public"],
-            "data": orjson.loads(template_row["data"].encode("utf-8")),
-            "created_at": str(template_row["created_at"]),
-            "modified_at": str(template_row["modified_at"])
-        }
-    
-    # if user is not same but is public and same domain then also we can give access
-    if row["is_public"] and row["domain"] == user_domain:
-        template_row = await db_session.fetchrow(
-            """
-            SELECT template_id, name, created_by, is_public, data, created_at, modified_at
-            FROM email_templates
-            WHERE template_id = $1
-            """,
-            template_id
+
+def _admin_required_mail_server(server_host, smtp_server, imap_server, sieve_server, smtp_port, imap_port, sieve_port) -> str:
+    """The host of an admin domain request, refused if the host or a port is missing"""
+    host = _admin_mail_server(server_host, smtp_server, imap_server, sieve_server)
+    if not host or None in (smtp_port, imap_port, sieve_port):
+        raise All_Exceptions(
+            message="A domain needs server_host, smtp_port, imap_port and sieve_port",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
         )
-        if not template_row:
-            return {}
-
-        return {
-            "template_id": template_row["template_id"],
-            "name": template_row["name"],
-            "created_by": template_row["created_by"],
-            "is_public": template_row["is_public"],
-            "data": orjson.loads(template_row["data"].encode("utf-8")),
-            "created_at": str(template_row["created_at"]),
-            "modified_at": str(template_row["modified_at"])
-        }
-
-    # If user is not same and its not public then deny access
-    return {}
+    return host
 
 
 async def admin_create_new_domain(
     db_session: PgSession,
     domain: str,
-    smtp_server: str,
-    smtp_port: int,
-    imap_server: str,
-    imap_port: int,
-    sieve_server: str,
-    sieve_port: int,
     is_active: bool,
-    is_v2_user: bool
+    server_host: Optional[str] = None,
+    smtp_port: Optional[int] = None,
+    imap_port: Optional[int] = None,
+    sieve_port: Optional[int] = None,
+    smtp_server: Optional[str] = None,
+    imap_server: Optional[str] = None,
+    sieve_server: Optional[str] = None
 ) -> None:
     """
-    Admin function to create a new domain in the database
+    Admin function to create a new domain with its mail server configuration (server_host + ports)
     """
+    host = _admin_required_mail_server(server_host, smtp_server, imap_server, sieve_server, smtp_port, imap_port, sieve_port)
+
     try:
-        await db_session.execute(
-            """
-            INSERT INTO domain_details (
-                domain, smtp_server, smtp_port,
-                imap_server, imap_port,
-                sieve_server, sieve_port,
-                is_active, is_v2_user
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9
+        async with db_session.transaction():
+            config_id = await db_session.fetchval(
+                """
+                INSERT INTO mail_server_config (server_host, smtp_port, imap_port, sieve_port)
+                VALUES ($1, $2, $3, $4)
+                RETURNING config_id
+                """,
+                host, smtp_port, imap_port, sieve_port
             )
-            """,
-            domain,
-            smtp_server,
-            smtp_port,
-            imap_server,
-            imap_port,
-            sieve_server,
-            sieve_port,
-            is_active,
-            is_v2_user
-        )
+            await db_session.execute(
+                """
+                INSERT INTO domains (domain, mail_server_config_id, is_active)
+                VALUES ($1, $2, $3)
+                """,
+                domain, config_id, is_active
+            )
 
     except Exception as e:
         logging.error(f"Error while creating new domain: {e}", exc_info=True)
@@ -727,38 +755,50 @@ async def admin_create_new_domain(
 async def admin_edit_domain(
     db_session: PgSession,
     domain: str,
-    smtp_server: str,
-    smtp_port: int,
-    imap_server: str,
-    imap_port: int,
-    sieve_server: str,
-    sieve_port: int,
     is_active: bool,
-    is_v2_user: bool
+    server_host: Optional[str] = None,
+    smtp_port: Optional[int] = None,
+    imap_port: Optional[int] = None,
+    sieve_port: Optional[int] = None,
+    smtp_server: Optional[str] = None,
+    imap_server: Optional[str] = None,
+    sieve_server: Optional[str] = None
 ) -> None:
     """
-    Admin function to edit an existing domain in the database
+    Admin function to edit an existing domain: its mail server configuration (created if it had none) and is_active
     """
+    host = _admin_required_mail_server(server_host, smtp_server, imap_server, sieve_server, smtp_port, imap_port, sieve_port)
+
     try:
-        await db_session.execute(
-            """
-            UPDATE domain_details
-            SET smtp_server = $2, smtp_port = $3,
-                imap_server = $4, imap_port = $5,
-                sieve_server = $6, sieve_port = $7,
-                is_active = $8, is_v2_user = $9
-            WHERE domain = $1
-            """,
-            domain,
-            smtp_server,
-            smtp_port,
-            imap_server,
-            imap_port,
-            sieve_server,
-            sieve_port,
-            is_active,
-            is_v2_user
-        )
+        async with db_session.transaction():
+            config_id = await db_session.fetchval(
+                "SELECT mail_server_config_id FROM domains WHERE domain = $1 FOR UPDATE", domain
+            )
+
+            if config_id is None:
+                config_id = await db_session.fetchval(
+                    """
+                    INSERT INTO mail_server_config (server_host, smtp_port, imap_port, sieve_port)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING config_id
+                    """,
+                    host, smtp_port, imap_port, sieve_port
+                )
+            else:
+                await db_session.execute(
+                    """
+                    UPDATE mail_server_config
+                    SET server_host = $2, smtp_port = $3, imap_port = $4, sieve_port = $5, updated_at = NOW()
+                    WHERE config_id = $1
+                    """,
+                    config_id, host, smtp_port, imap_port, sieve_port
+                )
+            await db_session.execute(
+                "UPDATE domains SET mail_server_config_id = $2, is_active = $3 WHERE domain = $1", domain, config_id, is_active
+            )
+
+    except All_Exceptions:
+        raise
 
     except Exception as e:
         logging.error(f"Error while editing domain: {e}", exc_info=True)
@@ -770,16 +810,16 @@ async def admin_edit_domain(
 
 async def admin_delete_domain(db_session: PgSession, domain: str) -> None:
     """
-    Admin function to delete a domain from the database
+    Admin function to delete a domain from the database (and its mail server configuration).
+    Its users, their contacts and templates are deleted with it (ON DELETE CASCADE).
     """
     try:
-        await db_session.execute(
-            """
-            DELETE FROM domain_details
-            WHERE domain = $1
-            """,
-            domain
-        )
+        async with db_session.transaction():
+            config_id = await db_session.fetchval(
+                "DELETE FROM domains WHERE domain = $1 RETURNING mail_server_config_id", domain
+            )
+            if config_id is not None:
+                await db_session.execute("DELETE FROM mail_server_config WHERE config_id = $1", config_id)
 
     except Exception as e:
         logging.error(f"Error while deleting domain: {e}", exc_info=True)
@@ -789,13 +829,38 @@ async def admin_delete_domain(db_session: PgSession, domain: str) -> None:
         )
 
 
+ADMIN_DOMAIN_COLUMNS = """
+    d.domain, d.is_active, d.created_at, d.mail_server_config_id,
+    c.server_host, c.smtp_port, c.imap_port, c.sieve_port
+"""
+
+
+def _admin_domain_row(row) -> dict:
+    """
+    A domain for the admin API. The old fields smtp_server, imap_server and sieve_server are kept for the admin screen
+    (one host for all three).
+    """
+    return {
+        "domain": row["domain"],
+        "server_host": row["server_host"],
+        "smtp_server": row["server_host"],
+        "smtp_port": row["smtp_port"],
+        "imap_server": row["server_host"],
+        "imap_port": row["imap_port"],
+        "sieve_server": row["server_host"],
+        "sieve_port": row["sieve_port"],
+        "is_active": row["is_active"],
+        "created_at": _ts(row["created_at"])
+    }
+
+
 async def admin_get_all_domains(db_session: PgSession, page: int, size: int, search_query: str) -> dict:
     """
     Admin function to get all domains from the database with pagination
     """
     total_count = await db_session.fetchval(
         """
-        SELECT COUNT(*) FROM domain_details WHERE domain ILIKE $1
+        SELECT COUNT(*) FROM domains WHERE domain ILIKE $1
         """,
         f"%{search_query}%"
     )
@@ -813,16 +878,14 @@ async def admin_get_all_domains(db_session: PgSession, page: int, size: int, sea
         )
 
     # Calculate the offset for pagination
-    offset = (page - 1) * size        
+    offset = (page - 1) * size
     rows = await db_session.fetch(
-        """
-        SELECT domain, smtp_server, smtp_port,
-               imap_server, imap_port, is_v2_user,
-               sieve_server, sieve_port,
-               is_active, created_at
-        FROM domain_details
-        WHERE domain ILIKE $3
-        ORDER BY created_at DESC
+        f"""
+        SELECT {ADMIN_DOMAIN_COLUMNS}
+        FROM domains d
+        LEFT JOIN mail_server_config c ON c.config_id = d.mail_server_config_id
+        WHERE d.domain ILIKE $3
+        ORDER BY d.created_at DESC
         LIMIT $1 OFFSET $2
         """,
         size,
@@ -842,21 +905,7 @@ async def admin_get_all_domains(db_session: PgSession, page: int, size: int, sea
         "first_page": 1,
         "last_page": (total_count + size - 1) // size,
         "page_number": page,
-        "data": [
-            {
-                "domain": row["domain"],
-                "smtp_server": row["smtp_server"],
-                "smtp_port": row["smtp_port"],
-                "imap_server": row["imap_server"],
-                "imap_port": row["imap_port"],
-                "sieve_server": row["sieve_server"],
-                "sieve_port": row["sieve_port"],
-                "is_active": row["is_active"],
-                "is_v2_user": row["is_v2_user"],
-                "created_at": str(row["created_at"])
-            }
-            for row in rows
-        ]
+        "data": [_admin_domain_row(row) for row in rows]
     }
 
 
@@ -865,31 +914,15 @@ async def admin_get_domain_info(db_session: PgSession, domain: str) -> dict:
     Admin function to get information about a specific domain
     """
     row = await db_session.fetchrow(
-        """
-        SELECT domain, smtp_server, smtp_port,
-               imap_server, imap_port, is_v2_user,
-               sieve_server, sieve_port,
-               is_active, created_at
-        FROM domain_details
-        WHERE domain = $1
+        f"""
+        SELECT {ADMIN_DOMAIN_COLUMNS}
+        FROM domains d
+        LEFT JOIN mail_server_config c ON c.config_id = d.mail_server_config_id
+        WHERE d.domain = $1
         """,
         domain
     )
-    if not row:
-        return {}
-
-    return {
-        "domain": row["domain"],
-        "smtp_server": row["smtp_server"],
-        "smtp_port": row["smtp_port"],
-        "imap_server": row["imap_server"],
-        "imap_port": row["imap_port"],
-        "sieve_server": row["sieve_server"],
-        "sieve_port": row["sieve_port"],
-        "is_active": row["is_active"],
-        "is_v2_user": row["is_v2_user"],
-        "created_at": str(row["created_at"])
-    }
+    return _admin_domain_row(row) if row else {}
 
 
 async def validate_origin_ip_blocked(admin_db_session: PgSession, ip_address: str, user_email: str) -> bool:

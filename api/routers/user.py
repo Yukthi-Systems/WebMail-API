@@ -34,7 +34,8 @@ from src.database import (
     create_user_session_in_cache,
     get_user_settings,
     replace_user_settings,
-    create_user_if_not_exists,
+    get_or_create_user,
+    delete_user,
     admin_create_new_domain,
     validate_origin_ip_blocked,
     admin_edit_domain,
@@ -59,7 +60,8 @@ LOGIN_ERROR_MESSAGES = {
     "ip_blocked": "Sign-in from your current location isn't allowed. Please contact your administrator.",
     "wrong_credentials": "Incorrect email or password.",
     "server_unreachable": "We couldn't reach your mail server. Please try again in a few minutes.",
-    "smtp_failed": "Your account can't send email right now. Please contact your administrator."
+    "smtp_failed": "Your account can't send email right now. Please contact your administrator.",
+    "use_sso": "Your organization signs in with single sign-on (SSO). Please use Login with SSO."
 }
 
 
@@ -91,9 +93,13 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
             content={"message": LOGIN_ERROR_MESSAGES["domain_inactive"]}
         )
 
-    # Check if the user is V2 User or not (That means the user is our platform user)
-    is_v2_user = server_details["is_v2_user"]
-    v2_domain_id, v2_mailbox_id = None, None
+    # Internal domain (no mail server configuration): its users log in with SSO, not with a password
+    if server_details["mail_server_config_id"] is None:
+        logging.info(f"Login: domain {data.domain} uses SSO (user {data.email})")
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["use_sso"], "login_method": "sso"}
+        )
 
     # if is_v2_user:
     #     # Find the MailBox ID and Domain ID for the user from the DB (For V2 Users)
@@ -151,6 +157,9 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
             content={"message": LOGIN_ERROR_MESSAGES["smtp_failed"]}
         )
     
+    # The user in the database (created on the first login)
+    db_user = await get_or_create_user(db_session=PgDB, user_email=data.email, user_domain=data.domain)
+
     # Create a session in the cache
     session_id, csrf_token = await create_user_session_in_cache(
         cache_session=CacheDB,
@@ -168,12 +177,10 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
         sieve_server=server_details["sieve_server"],
         sieve_port=server_details["sieve_port"],
         imap_password=data.password,
-        v2_domain_id=v2_domain_id,
-        v2_mailbox_id=v2_mailbox_id
+        user_id=db_user["user_id"],
+        organization_id=db_user["organization_id"],
+        organization_name=db_user["organization_name"]
     )
-
-    # Create a new user in DB if not exists
-    await create_user_if_not_exists(db_session=PgDB, user_email=data.email, user_domain=data.domain)
 
     # Create a session as cookie and return the response
     response = JSONResponse(
@@ -205,7 +212,7 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
     # Set the CSRF token in the response header
     response.headers["X-CSRF-Token"] = csrf_token
     response.headers["X-Session-Expiry"] = str(MAX_AGE_OF_CACHE)
-    response.headers["X-V2-User"] = str(is_v2_user)
+    response.headers["X-V2-User"] = "False"     # Password login is only for external domains (internal ones use SSO)
     # Allow Token and Expiry to be read by JS
     response.headers["Access-Control-Expose-Headers"] = "X-CSRF-Token, X-Session-Expiry, X-V2-User"
 
@@ -275,7 +282,7 @@ async def user_get_details(user: CurrentUser, PgDB: PostgresDep) -> JSONResponse
     """
     Get the user details from the database
     """
-    user_settings = await get_user_settings(db_session=PgDB, user_email=user["user_email"])
+    user_settings = await get_user_settings(db_session=PgDB, user_id=user["user_id"])
     if not user_settings:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -294,7 +301,7 @@ async def user_update_details(data: dict, user: CurrentUser, PgDB: PostgresDep) 
     """
     Update the user details in the database
     """
-    await replace_user_settings(db_session=PgDB, user_email=user["user_email"], settings=data)
+    await replace_user_settings(db_session=PgDB, user_id=user["user_id"], settings=data)
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"message": "User settings updated successfully"}
@@ -322,11 +329,11 @@ async def delete_self_user(request: Request, CacheDB: MemcachedDep, PgDB: Postgr
     # Destroy the session in the cache
     await CacheDB.delete(key=session_id.encode("utf-8"))
 
-    # Delete the user from the database
-    await PgDB.execute(
-        "DELETE FROM users WHERE email = $1",
-        user_details["user_email"]
-    )
+    # Delete the user from the database (sessions from before the new schema have no user_id)
+    if user_details.get("user_id"):
+        await delete_user(db_session=PgDB, user_id=user_details["user_id"])
+    else:
+        await PgDB.execute("DELETE FROM users WHERE email = $1", user_details["user_email"])
 
     # Send response to delete the cookie
     response = JSONResponse(
@@ -352,6 +359,22 @@ async def delete_self_user(request: Request, CacheDB: MemcachedDep, PgDB: Postgr
     return response
 
 
+def _admin_domain_fields(data: dict) -> dict:
+    """
+    Mail server fields of an admin domain request: server_host + ports.
+    The old form (smtp_server / imap_server / sieve_server) still works if the three are the same host.
+    """
+    return {
+        "server_host": data.get("server_host"),
+        "smtp_server": data.get("smtp_server"),
+        "imap_server": data.get("imap_server"),
+        "sieve_server": data.get("sieve_server"),
+        "smtp_port": data.get("smtp_port"),
+        "imap_port": data.get("imap_port"),
+        "sieve_port": data.get("sieve_port")
+    }
+
+
 # Create Domain
 @router.post("/admin/domain", response_class=JSONResponse, tags=["Admin"], summary="Create Domain")
 async def admin_create_domain(request: Request, data: dict, PgDB: PostgresDep) -> JSONResponse:
@@ -366,14 +389,8 @@ async def admin_create_domain(request: Request, data: dict, PgDB: PostgresDep) -
     await admin_create_new_domain(
         db_session=PgDB,
         domain=data["domain"],
-        imap_server=data["imap_server"],
-        imap_port=data["imap_port"],
-        smtp_server=data["smtp_server"],
-        smtp_port=data["smtp_port"],
-        sieve_server=data["sieve_server"],
-        sieve_port=data["sieve_port"],
         is_active=data.get("is_active", True),
-        is_v2_user=data.get("is_v2_user", False)
+        **_admin_domain_fields(data)
     )
 
     return JSONResponse(
@@ -396,14 +413,8 @@ async def admin_edit_domain_details(request: Request, domain: str, data: dict, P
     await admin_edit_domain(
         db_session=PgDB,
         domain=domain,
-        imap_server=data["imap_server"],
-        imap_port=data["imap_port"],
-        smtp_server=data["smtp_server"],
-        smtp_port=data["smtp_port"],
-        sieve_server=data["sieve_server"],
-        sieve_port=data["sieve_port"],
-        is_active=data["is_active"],
-        is_v2_user=data["is_v2_user"]
+        is_active=data.get("is_active", True),
+        **_admin_domain_fields(data)
     )
 
     return JSONResponse(
