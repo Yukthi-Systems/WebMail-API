@@ -44,7 +44,7 @@ from src.database import (
     admin_get_domain_info
 )
 from src.main import check_smtp_login, check_imap_login, CurrentUser, validate_recaptcha
-from src.utils.base.constants import MAX_AGE_OF_CACHE, API_KEY, API_COOKIE_DOMAIN
+from src.utils.base.constants import MAX_AGE_OF_CACHE, API_KEY
 from src.utils.models import All_Exceptions, AuthRequest
 
 
@@ -161,7 +161,7 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
     db_user = await get_or_create_user(db_session=PgDB, user_email=data.email, user_domain=data.domain)
 
     # Create a session in the cache
-    session_id, csrf_token = await create_user_session_in_cache(
+    session_id = await create_user_session_in_cache(
         cache_session=CacheDB,
         user_email=data.email,
         raw_password=data.password,
@@ -182,86 +182,39 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
         organization_name=db_user["organization_name"]
     )
 
-    # Create a session as cookie and return the response
+    # Create a session as response headers and return the response
     response = JSONResponse(
         status_code=status.HTTP_200_OK,
-        content={"message": "All Credentials are valid - Login successful"}
+        content={
+            "message": "All Credentials are valid - Login successful",
+            "session_id": session_id
+        }
     )
 
-    response.set_cookie(
-        key="SESSION_ID",
-        value=session_id,
-        max_age=MAX_AGE_OF_CACHE,
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        domain=API_COOKIE_DOMAIN
-    )
-
-    # Set the logged in status in the Cookie (for JS - to read)
-    response.set_cookie(
-        key="IS_SESSION_VALID",
-        value="true",
-        max_age=MAX_AGE_OF_CACHE,
-        httponly=False,  # IMPORTANT: Let JS read it
-        secure=True,
-        samesite="strict",
-        domain=API_COOKIE_DOMAIN
-    )
-
-    # Set the CSRF token in the response header
-    response.headers["X-CSRF-Token"] = csrf_token
+    # Set the session expiry in the response header
     response.headers["X-Session-Expiry"] = str(MAX_AGE_OF_CACHE)
-    response.headers["X-V2-User"] = "False"     # Password login is only for external domains (internal ones use SSO)
-    # Allow Token and Expiry to be read by JS
-    response.headers["Access-Control-Expose-Headers"] = "X-CSRF-Token, X-Session-Expiry, X-V2-User"
+    response.headers["Access-Control-Expose-Headers"] = "X-Session-Expiry"
 
     return response
 
 
-# Logout from WebMail - Destroy the session, cookie and close the pool
+# Logout from WebMail - Destroy the session and close the pool
 @router.delete("/logout", response_class=JSONResponse, tags=["User"], summary="Logout from WebMail")
 async def user_logout_webmail(request: Request, CacheDB: MemcachedDep) -> JSONResponse:
     """
-    Logout from WebMail - Destroy the session, cookie and close the pool
+    Logout from WebMail - Destroy the session and close the pool
     """
-    session_id = request.cookies.get("SESSION_ID")
+    session_id = request.headers.get("X-Session-Token")
     if not session_id:
         raise All_Exceptions(message="Session ID not found", status_code=status.HTTP_406_NOT_ACCEPTABLE)
-    
-    user_data_bytes = await CacheDB.get(session_id.encode("utf-8"))
-    if not user_data_bytes:
-        raise All_Exceptions(message="Session expired", status_code=status.HTTP_401_UNAUTHORIZED)
-
-    user_details = orjson.loads(user_data_bytes)
-    if user_details["csrf_token"] != request.headers.get("X-CSRF-Token"):
-        raise All_Exceptions(message="CSRF token mismatch", status_code=status.HTTP_401_UNAUTHORIZED)
 
     # Destroy the session in the cache
     await CacheDB.delete(key=session_id.encode("utf-8"))
 
-    # Send response to delete the cookie
-    response = JSONResponse(
+    return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"message": "Logout successful, session destroyed"}
     )
-
-    response.delete_cookie(
-        key="SESSION_ID",
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        domain=API_COOKIE_DOMAIN
-    )
-    response.delete_cookie(
-        key="IS_SESSION_VALID",
-        httponly=False,
-        secure=True,
-        samesite="strict",
-        domain=API_COOKIE_DOMAIN
-    )
-
-    return response
 
 
 # Validate the session
@@ -312,19 +265,17 @@ async def user_update_details(data: dict, user: CurrentUser, PgDB: PostgresDep) 
 @router.delete("/delete", response_class=JSONResponse, tags=["User"], summary="Delete User and all the associated data")
 async def delete_self_user(request: Request, CacheDB: MemcachedDep, PgDB: PostgresDep) -> JSONResponse:
     """
-    Logout from WebMail - Destroy the session, cookie and close the pool
+    Delete the user and all the associated data, destroy the session and close the pool
     """
-    session_id = request.cookies.get("SESSION_ID")
+    session_id = request.headers.get("X-Session-Token")
     if not session_id:
         raise All_Exceptions(message="Session ID not found", status_code=status.HTTP_406_NOT_ACCEPTABLE)
-    
+
     user_data_bytes = await CacheDB.get(session_id.encode("utf-8"))
     if not user_data_bytes:
         raise All_Exceptions(message="Session expired", status_code=status.HTTP_401_UNAUTHORIZED)
 
     user_details = orjson.loads(user_data_bytes)
-    if user_details["csrf_token"] != request.headers.get("X-CSRF-Token"):
-        raise All_Exceptions(message="CSRF token mismatch", status_code=status.HTTP_401_UNAUTHORIZED)
 
     # Destroy the session in the cache
     await CacheDB.delete(key=session_id.encode("utf-8"))
@@ -335,28 +286,10 @@ async def delete_self_user(request: Request, CacheDB: MemcachedDep, PgDB: Postgr
     else:
         await PgDB.execute("DELETE FROM users WHERE email = $1", user_details["user_email"])
 
-    # Send response to delete the cookie
-    response = JSONResponse(
+    return JSONResponse(
         status_code=status.HTTP_200_OK,
-        content={"message": "Logout successful, session destroyed"}
+        content={"message": "Deleted all your data and logged out successfully"}
     )
-
-    response.delete_cookie(
-        key="SESSION_ID",
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        domain=API_COOKIE_DOMAIN
-    )
-    response.delete_cookie(
-        key="IS_SESSION_VALID",
-        httponly=False,
-        secure=True,
-        samesite="strict",
-        domain=API_COOKIE_DOMAIN
-    )
-
-    return response
 
 
 def _admin_domain_fields(data: dict) -> dict:

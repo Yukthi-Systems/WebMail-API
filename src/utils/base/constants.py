@@ -59,7 +59,6 @@ GOOGLE_RECAPTCHA_SITE_KEY = os.getenv("GOOGLE_RECAPTCHA_SITE_KEY", "google-recap
 GOOGLE_RECAPTCHA_API_KEY = os.getenv("GOOGLE_RECAPTCHA_API_KEY", "google-recaptcha-api-key")
 
 API_KEY = os.environ.get("API_KEY", "internal-api-key")
-API_COOKIE_DOMAIN = os.environ.get("API_COOKIE_DOMAIN", ".example.com")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://api.webmail.example.com,https://webmail-ui.example.com").split(",")
 LOCAL_SMTP_HOST_NAME = os.environ.get("LOCAL_SMTP_HOST_NAME", "example.com")
 SMTP_CONNECTION_TIMEOUT = int(os.environ.get("SMTP_CONNECTION_TIMEOUT", 10))  # Timeout in seconds

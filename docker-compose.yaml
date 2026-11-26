@@ -57,7 +57,6 @@ services:
       - NUMBER_OF_LOGS_TO_DISPLAY=200
 
       - API_KEY=internal-api-key
-      - API_COOKIE_DOMAIN=.example.com
       - LOCAL_SMTP_HOST_NAME=example.com
       - SMTP_CONNECTION_TIMEOUT=10
       - ALLOWED_ORIGINS=https://api.webmail.example.com,https://webmail-ui.example.com

@@ -148,21 +148,15 @@ async def get_current_user_session_details(request: Request, CacheDB: MemcachedD
     """
     Get current user session details from the cache
     """
-    session_id = request.cookies.get("SESSION_ID")
+    session_id = request.headers.get("X-Session-Token")
     if not session_id:
         raise All_Exceptions(message="Session ID not found", status_code=status.HTTP_406_NOT_ACCEPTABLE)
-
-    csrf_token = request.headers.get("X-CSRF-Token")
-    if not csrf_token:
-        raise All_Exceptions(message="CSRF token not found", status_code=status.HTTP_406_NOT_ACCEPTABLE)
 
     user_data_bytes = await CacheDB.get(session_id.encode("utf-8"))
     if not user_data_bytes:
         raise All_Exceptions(message="Session expired", status_code=status.HTTP_401_UNAUTHORIZED)
-    
+
     user_data = orjson.loads(user_data_bytes)
-    if user_data["csrf_token"] != csrf_token:
-        raise All_Exceptions(message="CSRF token mismatch", status_code=status.HTTP_401_UNAUTHORIZED)
 
     # A session from before the new database schema has no user_id: log in again
     if not user_data.get("user_id"):

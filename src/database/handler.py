@@ -91,7 +91,7 @@ async def create_user_session_in_cache(
     imap_server: str, imap_port: int, imap_user: str, imap_password: str,
     sieve_server: str, sieve_port: int, sieve_user: str, sieve_password: str,
     user_id: str, organization_id: str, organization_name: str
-) -> tuple[str, str]:
+) -> str:
     """
     Create a user session in the cache and return the session ID and CSRF token
     This function generates a session ID and CSRF token, and stores the user details in the cache
@@ -99,7 +99,6 @@ async def create_user_session_in_cache(
     try:
         # Create a session ID (UUID)
         session_id = str(uuid.uuid4())
-        csrf_token = str(uuid.uuid4())
 
         # Store the session details in the cache
         await cache_session.set(
@@ -129,14 +128,12 @@ async def create_user_session_in_cache(
                 "sieve_server": sieve_server,
                 "sieve_port": sieve_port,
                 "sieve_user": sieve_user,
-                "sieve_password": sieve_password,
-
-                "csrf_token": csrf_token
+                "sieve_password": sieve_password
             }),
             exptime=MAX_AGE_OF_CACHE
         )
 
-        return session_id, csrf_token
+        return session_id
 
     except Exception as e:
         logging.error(f"Error creating user session: {e}", exc_info=True)
