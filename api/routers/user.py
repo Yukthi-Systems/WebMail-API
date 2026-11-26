@@ -204,6 +204,22 @@ async def sso_login_webmail(request: Request, CacheDB: MemcachedDep, PgDB: Postg
     mailbox_info = sso_user_details["mailbox_info"]
     raw_password = sso_user_details["raw_password"]
 
+    # The domain must be registered (by the admin) and active, the same checks as the password login
+    domain_details = await get_domain_details(db_session=PgDB, domain=mailbox_info["domain_name"])
+    if not domain_details:
+        logging.warning(f"SSO login: domain {mailbox_info['domain_name']} is not registered (user {mailbox_info['email']})")
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["domain_not_found"]}
+        )
+
+    if not domain_details["is_active"]:
+        logging.warning(f"SSO login: domain {mailbox_info['domain_name']} is inactive (user {mailbox_info['email']})")
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["domain_inactive"]}
+        )
+
     # Validate the IMAP details (SMTP is checked only if IMAP login works)
     imap_result = check_imap_login(
         imap_server=mailbox_info["server_host_name"],
@@ -240,7 +256,13 @@ async def sso_login_webmail(request: Request, CacheDB: MemcachedDep, PgDB: Postg
         )
 
     # The user in the database (created on the first login)
-    db_user = await get_or_create_user(db_session=PgDB, user_email=mailbox_info["email"], user_domain=mailbox_info["domain_name"])
+    db_user = await get_or_create_user(
+        db_session=PgDB,
+        user_email=mailbox_info["email"],
+        user_domain=mailbox_info["domain_name"],
+        organization_id=mailbox_info["organization_id"],
+        organization_name=mailbox_info["organization_name"]
+    )
 
     # Create a session in the cache
     session_id = await create_user_session_in_cache(

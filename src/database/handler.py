@@ -188,33 +188,55 @@ async def replace_user_settings(db_session: PgSession, user_id: str, settings: d
         )
 
 
-async def get_or_create_user(db_session: PgSession, user_email: str, user_domain: str) -> dict:
+async def get_or_create_user(db_session: PgSession, user_email: str, user_domain: str, organization_id: Optional[str] = None, organization_name: Optional[str] = None) -> dict:
     """
     Get the user by email, or create it (random user_id, the default settings) on the first login.
-    Users of external domains share one organization per domain (see external_organization_id).
+    organization_id / organization_name: the user's organization from SSO. Saved on every SSO login, so a user who moved to
+    another organization in SSO moves here too, with their contacts and templates (they keep a copy of organization_id).
+    Without them (password login): a new user gets the shared organization of their domain (see external_organization_id),
+    an existing user keeps the organization they have.
     Returns user_id, organization_id and organization_name.
     """
+    from_sso = organization_id is not None
     try:
-        row = await db_session.fetchrow(
-            """
-            WITH new_user AS (
-                INSERT INTO users (user_id, email, domain, organization_id, organization_name, private_info, public_info)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb)
-                ON CONFLICT (email) DO NOTHING
-                RETURNING user_id, organization_id, organization_name
+        if from_sso:
+            organization_id = uuid.UUID(str(organization_id))    # Refuses an SSO value that is not a UUID
+        else:
+            organization_id, organization_name = external_organization_id(user_domain), user_domain
+
+        async with db_session.transaction():
+            row = await db_session.fetchrow(
+                "SELECT user_id, organization_id, organization_name FROM users WHERE email = $1 FOR UPDATE", user_email
             )
-            SELECT user_id, organization_id, organization_name FROM new_user
-            UNION ALL
-            SELECT user_id, organization_id, organization_name FROM users WHERE email = $2
-            LIMIT 1
-            """,
-            uuid.uuid4(),
-            user_email,
-            user_domain,
-            external_organization_id(user_domain),
-            user_domain,
-            orjson.dumps({"settings": PRE_DEFINED_SETTINGS}).decode("utf-8")
-        )
+
+            if row is None:
+                row = await db_session.fetchrow(
+                    """
+                    INSERT INTO users (user_id, email, domain, organization_id, organization_name, private_info, public_info)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb)
+                    ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email    -- created at the same moment by another login
+                    RETURNING user_id, organization_id, organization_name
+                    """,
+                    uuid.uuid4(),
+                    user_email,
+                    user_domain,
+                    organization_id,
+                    organization_name,
+                    orjson.dumps({"settings": PRE_DEFINED_SETTINGS}).decode("utf-8")
+                )
+
+            elif from_sso and (row["organization_id"], row["organization_name"]) != (organization_id, organization_name):
+                row = await db_session.fetchrow(
+                    """
+                    UPDATE users SET organization_id = $2, organization_name = $3
+                    WHERE user_id = $1
+                    RETURNING user_id, organization_id, organization_name
+                    """,
+                    row["user_id"], organization_id, organization_name
+                )
+                await db_session.execute("UPDATE contacts SET organization_id = $2 WHERE user_id = $1", row["user_id"], organization_id)
+                await db_session.execute("UPDATE email_templates SET organization_id = $2 WHERE user_id = $1", row["user_id"], organization_id)
+
         return {
             "user_id": str(row["user_id"]),
             "organization_id": str(row["organization_id"]),
