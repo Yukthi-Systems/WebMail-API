@@ -19,10 +19,25 @@ Basic functions required for the project are defined here
 
 
 from .utils.base.libraries import smtplib, IMAP4_SSL, logging, Request, orjson, status, Annotated, Depends, pika, uuid, datetime, timezone, requests, UploadFile, base64
-from .utils.base.constants import RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_VIRTUAL_HOST, RABBITMQ_USERNAME, RABBITMQ_PASSWORD, RABBITMQ_EXCHANGE, RABBITMQ_ROUTING_KEY, GOOGLE_RECAPTCHA_PROJECT_ID, GOOGLE_RECAPTCHA_API_KEY, GOOGLE_RECAPTCHA_SITE_KEY, LOCAL_SMTP_HOST_NAME, SMTP_CONNECTION_TIMEOUT
 from .utils.models import All_Exceptions, SendMailForm
 from .imap import get_imap_connection, is_login_rejected
 from .database import MemcachedDep
+from .utils.base.constants import (
+    GOOGLE_RECAPTCHA_PROJECT_ID,
+    GOOGLE_RECAPTCHA_SITE_KEY,
+    GOOGLE_RECAPTCHA_API_KEY,
+    SMTP_CONNECTION_TIMEOUT,
+    RABBITMQ_VIRTUAL_HOST,
+    RABBITMQ_ROUTING_KEY,
+    LOCAL_SMTP_HOST_NAME,
+    RABBITMQ_USERNAME,
+    RABBITMQ_PASSWORD,
+    RABBITMQ_EXCHANGE,
+    SSO_AUTH_API_KEY,
+    RABBITMQ_HOST,
+    RABBITMQ_PORT,
+    SSO_BASE_URL
+)
 
 
 def validate_smtp_details(smtp_server: str, smtp_port: int, smtp_user: str, smtp_password: str) -> bool:
@@ -391,3 +406,37 @@ def validate_recaptcha(token: str) -> bool:
     except Exception as e:
         logging.error(f"Error validating recaptcha token: {e}", exc_info=True)
         return False
+
+
+def get_details_from_sso_token(token: str) -> dict:
+    """
+    Get user details from the SSO token
+    :param token: The SSO token to be decoded
+    :return: A dictionary containing user details if the token is valid, empty dictionary otherwise
+    """
+    url = f"{SSO_BASE_URL}/internal/mailbox/user-info/{token}"
+    try:
+        headers = {
+            "X-API-Key": SSO_AUTH_API_KEY
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        # On Success = 
+        # {
+        #     "mailbox_info": {
+        #         "domain_name": "v3-demo1.example.com",
+        #         "email": "testdemo1@v3-demo1.example.com",
+        #         "first_name": "testdemo1",
+        #         "identity_id": "xx-xx-x-xxx",
+        #         "last_name": "",
+        #         "organization_id": "xxx-xxx-xx-xxx",
+        #         "organization_name": "Mail Service 25",
+        #         "server_host_name": "mail-1.example.net"
+        #     },
+        #     "raw_password": "<REAL_PASSWORD>"
+        # }
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error decoding SSO token: {e}", exc_info=True)
+        return {}

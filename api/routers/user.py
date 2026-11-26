@@ -43,7 +43,7 @@ from src.database import (
     admin_get_all_domains,
     admin_get_domain_info
 )
-from src.main import check_smtp_login, check_imap_login, CurrentUser, validate_recaptcha
+from src.main import check_smtp_login, check_imap_login, CurrentUser, validate_recaptcha, get_details_from_sso_token
 from src.utils.base.constants import MAX_AGE_OF_CACHE, API_KEY
 from src.utils.models import All_Exceptions, AuthRequest
 
@@ -54,6 +54,8 @@ router = APIRouter()
 
 # User friendly login error messages (the technical reason is written to the logs)
 LOGIN_ERROR_MESSAGES = {
+    "sso_token_invalid": "Invalid SSO token. Please sign in through your organization's SSO.",
+    "sso_token_missing": "Single sign-on (SSO) session is missing. Please sign in through your organization's SSO.",
     "recaptcha_failed": "Verification failed. Please refresh the page and try again.",
     "domain_not_found": "This email domain isn't set up for WebMail. Please contact your administrator.",
     "domain_inactive": "This account is currently disabled. Please contact your administrator.",
@@ -100,27 +102,6 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={"message": LOGIN_ERROR_MESSAGES["use_sso"], "login_method": "sso"}
         )
-
-    # if is_v2_user:
-    #     # Find the MailBox ID and Domain ID for the user from the DB (For V2 Users)
-    #     # Checked before the IP check, so a missing user is not reported as a blocked IP
-    #     v2_mailbox_id, v2_domain_id = await get_v2_ids(admin_db_session=AdminPgDB, user_email=data.email)
-    #     if not v2_domain_id or not v2_mailbox_id:
-    #         # Same message as a wrong password - do not reveal which email addresses exist
-    #         logging.warning(f"Login: user {data.email} not found in the V2 admin DB")
-    #         return JSONResponse(
-    #             status_code=status.HTTP_401_UNAUTHORIZED,
-    #             content={"message": LOGIN_ERROR_MESSAGES["wrong_credentials"]}
-    #         )
-
-    #     # Check if IP is blocked or not
-    #     ip_validation_result = await validate_origin_ip_blocked(admin_db_session=AdminPgDB, ip_address=request.headers.get('X-Real-IP'), user_email=data.email)
-    #     if not ip_validation_result:    # If it returns False, that means the IP is blocked
-    #         logging.warning(f"Login: access blocked for user {data.email} from IP {request.headers.get('X-Real-IP')}")
-    #         return JSONResponse(
-    #             status_code=status.HTTP_403_FORBIDDEN,
-    #             content={"message": LOGIN_ERROR_MESSAGES["ip_blocked"]}
-    #         )
 
     # Validate the IMAP details (SMTP is checked only if IMAP login works)
     imap_result = check_imap_login(
@@ -187,6 +168,107 @@ async def user_login_webmail(request: Request, data: AuthRequest, CacheDB: Memca
         status_code=status.HTTP_200_OK,
         content={
             "message": "All Credentials are valid - Login successful",
+            "session_id": session_id
+        }
+    )
+
+    # Set the session expiry in the response header
+    response.headers["X-Session-Expiry"] = str(MAX_AGE_OF_CACHE)
+    response.headers["Access-Control-Expose-Headers"] = "X-Session-Expiry"
+
+    return response
+
+
+# Login to WebMail - Validate IMAP and SMTP credentials (Create a session)
+@router.post("/login/sso", response_class=JSONResponse, tags=["User"], summary="Login to WebMail")
+async def sso_login_webmail(request: Request, CacheDB: MemcachedDep, PgDB: PostgresDep) -> JSONResponse:
+    """
+    Login to WebMail via SSO (Create a session)
+    """
+    # Extract the SSO token from the cookie
+    sso_token = request.cookies.get("SSO-Session-ID")
+    if not sso_token:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["sso_token_missing"]}
+        )
+
+    # Get user details from the SSO token
+    sso_user_details = get_details_from_sso_token(token=sso_token)
+    if not sso_user_details.get("mailbox_info"):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["sso_token_invalid"]}
+        )
+
+    mailbox_info = sso_user_details["mailbox_info"]
+    raw_password = sso_user_details["raw_password"]
+
+    # Validate the IMAP details (SMTP is checked only if IMAP login works)
+    imap_result = check_imap_login(
+        imap_server=mailbox_info["server_host_name"],
+        imap_port=993,
+        imap_user=mailbox_info["email"],
+        imap_password=raw_password
+    )
+    if imap_result == "auth_failed":
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["wrong_credentials"]}
+        )
+    if imap_result != "ok":
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"message": LOGIN_ERROR_MESSAGES["server_unreachable"]}
+        )
+
+    smtp_result = check_smtp_login(
+        smtp_server=mailbox_info["server_host_name"],
+        smtp_port=587,
+        smtp_user=mailbox_info["email"],
+        smtp_password=raw_password
+    )
+    if smtp_result == "unreachable":
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"message": LOGIN_ERROR_MESSAGES["server_unreachable"]}
+        )
+    if smtp_result != "ok":
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"message": LOGIN_ERROR_MESSAGES["smtp_failed"]}
+        )
+
+    # The user in the database (created on the first login)
+    db_user = await get_or_create_user(db_session=PgDB, user_email=mailbox_info["email"], user_domain=mailbox_info["domain_name"])
+
+    # Create a session in the cache
+    session_id = await create_user_session_in_cache(
+        cache_session=CacheDB,
+        user_email=mailbox_info["email"],
+        raw_password=raw_password,
+        smtp_server=mailbox_info["server_host_name"],
+        smtp_port=587,
+        smtp_user=mailbox_info["email"],
+        smtp_password=raw_password,
+        imap_server=mailbox_info["server_host_name"],
+        imap_port=993,
+        imap_user=mailbox_info["email"],
+        sieve_user=mailbox_info["email"],
+        sieve_password=raw_password,
+        sieve_server=mailbox_info["server_host_name"],
+        sieve_port=4190,
+        imap_password=raw_password,
+        user_id=db_user["user_id"],
+        organization_id=db_user["organization_id"],
+        organization_name=db_user["organization_name"]
+    )
+
+    # Create a session as response headers and return the response
+    response = JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "message": "SSO Credentials are valid - Login successful",
             "session_id": session_id
         }
     )

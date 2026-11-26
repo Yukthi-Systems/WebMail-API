@@ -58,6 +58,9 @@ GOOGLE_RECAPTCHA_PROJECT_ID = os.getenv("GOOGLE_RECAPTCHA_PROJECT_ID", "google-r
 GOOGLE_RECAPTCHA_SITE_KEY = os.getenv("GOOGLE_RECAPTCHA_SITE_KEY", "google-recaptcha-site-key")
 GOOGLE_RECAPTCHA_API_KEY = os.getenv("GOOGLE_RECAPTCHA_API_KEY", "google-recaptcha-api-key")
 
+SSO_AUTH_API_KEY = os.environ.get("SSO_AUTH_API_KEY", "sso-auth-api-key")
+SSO_BASE_URL = os.environ.get("SSO_BASE_URL", "https://sso.domain.tld")
+
 API_KEY = os.environ.get("API_KEY", "internal-api-key")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://api.webmail.example.com,https://webmail-ui.example.com").split(",")
 LOCAL_SMTP_HOST_NAME = os.environ.get("LOCAL_SMTP_HOST_NAME", "example.com")
