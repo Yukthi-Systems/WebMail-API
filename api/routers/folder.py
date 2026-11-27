@@ -312,11 +312,12 @@ def get_uid_validity(folder_path: str, user: CurrentUser) -> JSONResponse:
     """Get the UID Validity for a folder path"""
     imap_connection = get_imap_connection_from_user_data(user=user)
 
-    uid_status, uid_data = imap_connection.status(f'"{folder_path}"', "(UIDNEXT UIDVALIDITY MESSAGES)")
+    uid_status, uid_data = imap_connection.status(f'"{folder_path}"', "(UIDNEXT UIDVALIDITY MESSAGES UNSEEN)")
     if uid_status == "OK":
         uid_string_data = uid_data[0].decode("utf-8") if len(uid_data) > 0 and isinstance(uid_data[0], bytes) else ""
-        # Extract key-value pairs inside parentheses
-        pairs = dict(re.findall(r'(\w+)\s+(\d+)', uid_string_data))
+        # Key-value pairs of the last parentheses only, so digits in the folder name are not read
+        inner = re.search(r'\(([^()]*)\)\s*$', uid_string_data)
+        pairs = dict(re.findall(r'(\w+)\s+(\d+)', inner.group(1) if inner else ""))
         uid_data = {k: int(v) for k, v in pairs.items()}
     else:
         return JSONResponse(

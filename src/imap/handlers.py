@@ -1442,8 +1442,9 @@ def parse_quota_response(quota_response: str) -> dict:
 def move_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_folder: str, dest_folder: str, use_uid: bool = False) -> dict:
     """
     Move multiple emails from source_folder to dest_folder
-    use_uid: email_ids are UIDs - uses UID MOVE (RFC 6851) if the server supports it, otherwise UID COPY + UID STORE \\Deleted
-    and expunges only the moved emails (UID EXPUNGE, if the server supports UIDPLUS)
+    use_uid: email_ids are UIDs - moved with one command per batch: UID MOVE (RFC 6851) if the server supports it,
+    otherwise UID COPY + UID STORE \\Deleted, expunging only the moved emails (UID EXPUNGE, if the server supports UIDPLUS).
+    A batch the server refuses is retried one email at a time, so each email still gets its own result.
     """
     # Select the source folder
     select_status, _ = connection.select(mailbox=source_folder, readonly=False)
@@ -1452,15 +1453,13 @@ def move_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_fol
 
     use_move = use_uid and "MOVE" in _server_capabilities(connection)
 
+    if use_uid:
+        return _move_uids_in_batches(connection, list(map(str, email_ids)), dest_folder, use_move)
+
     results = {}
     deleted_ids = []
     for email_id in map(str, email_ids):
         try:
-            if use_move:
-                move_status, _ = connection.uid("MOVE", email_id, dest_folder)
-                results[email_id] = "Moved successfully" if move_status == 'OK' else "Move failed"
-                continue
-
             copy_status, _ = _imap_command(connection, use_uid, "COPY", email_id, dest_folder)
             if copy_status != 'OK':
                 results[email_id] = "Copy failed"
@@ -1477,12 +1476,88 @@ def move_multiple_emails(connection: IMAP4_SSL, email_ids: list[str], source_fol
         except Exception as e:
             results[email_id] = f"Error: {str(e)}"
 
-    if use_move:
-        return results
-
-    expunge_status, _ = _expunge_uids(connection, deleted_ids) if use_uid else connection.expunge()
+    expunge_status, _ = connection.expunge()
     if expunge_status != 'OK':
         results["expunge"] = "Failed to expunge deleted emails"
+
+    return results
+
+
+MOVE_BATCH_SIZE = 1000
+
+
+def _move_uids_in_batches(connection: IMAP4_SSL, uids: list[str], dest_folder: str, use_move: bool) -> dict:
+    """Move UIDs with one command per batch (same results as moving them one by one, in a fraction of the time)"""
+    results = {}
+    deleted_ids = []
+    destination = _quoted_folder(dest_folder)
+    valid = []
+    for uid in dict.fromkeys(uids):     # Without duplicates, in the given order
+        if uid.isdigit() and int(uid) > 0:
+            valid.append(uid)
+        else:
+            results[uid] = "Error: not a valid UID"
+    uids = valid
+
+    for start in range(0, len(uids), MOVE_BATCH_SIZE):
+        batch = uids[start:start + MOVE_BATCH_SIZE]
+        uid_set = compress_ranges([int(uid) for uid in batch])
+        copied = False
+        try:
+            if use_move:
+                move_status, _ = connection.uid("MOVE", uid_set, destination)
+                if move_status == 'OK':
+                    results.update({uid: "Moved successfully" for uid in batch})
+                    continue
+            else:
+                copy_status, _ = connection.uid("COPY", uid_set, destination)
+                copied = copy_status == 'OK'
+                if copied:
+                    store_status, _ = connection.uid("STORE", uid_set, '+FLAGS.SILENT', '(\\Deleted)')
+                    if store_status == 'OK':
+                        deleted_ids.extend(batch)
+                        results.update({uid: "Moved successfully" for uid in batch})
+                        continue
+        except Exception as e:
+            logging.warning(f"Batch move of {len(batch)} emails failed: {e}")
+            if copied:
+                results.update({uid: f"Error: {str(e)}" for uid in batch})
+                continue
+
+        if copied:
+            # Already copied but not marked: never copy them again (same result as the one-by-one move)
+            results.update({uid: "Failed to mark as deleted" for uid in batch})
+            continue
+
+        # The server refused the batch: one email at a time, as before
+        for uid in batch:
+            try:
+                if use_move:
+                    move_status, _ = connection.uid("MOVE", uid, dest_folder)
+                    results[uid] = "Moved successfully" if move_status == 'OK' else "Move failed"
+                    continue
+
+                copy_status, _ = connection.uid("COPY", uid, dest_folder)
+                if copy_status != 'OK':
+                    results[uid] = "Copy failed"
+                    continue
+
+                store_status, _ = connection.uid("STORE", uid, '+FLAGS', '\\Deleted')
+                if store_status != 'OK':
+                    results[uid] = "Failed to mark as deleted"
+                    continue
+
+                deleted_ids.append(uid)
+                results[uid] = "Moved successfully"
+
+            except Exception as e:
+                results[uid] = f"Error: {str(e)}"
+
+    # Nothing marked: no EXPUNGE, it would remove other emails marked as deleted in the folder
+    if not use_move and deleted_ids:
+        expunge_status, _ = _expunge_uids(connection, deleted_ids)
+        if expunge_status != 'OK':
+            results["expunge"] = "Failed to expunge deleted emails"
 
     return results
 
