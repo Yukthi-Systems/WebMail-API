@@ -396,22 +396,6 @@ async def delete_self_user(request: Request, CacheDB: MemcachedDep, PgDB: Postgr
     )
 
 
-def _admin_domain_fields(data: dict) -> dict:
-    """
-    Mail server fields of an admin domain request: server_host + ports.
-    The old form (smtp_server / imap_server / sieve_server) still works if the three are the same host.
-    """
-    return {
-        "server_host": data.get("server_host"),
-        "smtp_server": data.get("smtp_server"),
-        "imap_server": data.get("imap_server"),
-        "sieve_server": data.get("sieve_server"),
-        "smtp_port": data.get("smtp_port"),
-        "imap_port": data.get("imap_port"),
-        "sieve_port": data.get("sieve_port")
-    }
-
-
 # Create Domain
 @router.post("/admin/domain", response_class=JSONResponse, tags=["Admin"], summary="Create Domain")
 async def admin_create_domain(request: Request, data: dict, PgDB: PostgresDep) -> JSONResponse:
@@ -427,7 +411,7 @@ async def admin_create_domain(request: Request, data: dict, PgDB: PostgresDep) -
         db_session=PgDB,
         domain=data["domain"],
         is_active=data.get("is_active", True),
-        **_admin_domain_fields(data)
+        data=data
     )
 
     return JSONResponse(
@@ -451,7 +435,7 @@ async def admin_edit_domain_details(request: Request, domain: str, data: dict, P
         db_session=PgDB,
         domain=domain,
         is_active=data.get("is_active", True),
-        **_admin_domain_fields(data)
+        data=data
     )
 
     return JSONResponse(

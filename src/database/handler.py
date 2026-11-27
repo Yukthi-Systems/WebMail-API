@@ -33,6 +33,16 @@ MemCacheSession: TypeAlias = aiomcache.Client
 EXTERNAL_ORGANIZATION_NAMESPACE = uuid.UUID("3b2f6a58-4f0e-4c8e-9a51-6f3c2d8e7b10")
 
 
+# user_id of every user is derived from their email (lower case), so the same email always gets the same id
+# (also in the migration from the old schema: migrations/new-schema/main.go uses the same namespace - never change it)
+USER_ID_NAMESPACE = uuid.UUID("9d1c7c2e-5b8a-4e7f-a3d6-2f8b1c4e6a90")
+
+
+def user_id_for_email(email: str) -> uuid.UUID:
+    """user_id of a user, derived from their email"""
+    return uuid.uuid5(USER_ID_NAMESPACE, email.strip().lower())
+
+
 def external_organization_id(domain: str) -> uuid.UUID:
     """Organization id of an external domain (the same for every user of that domain)"""
     return uuid.uuid5(EXTERNAL_ORGANIZATION_NAMESPACE, domain.lower())
@@ -51,7 +61,7 @@ async def get_domain_details(db_session: PgSession, domain: str) -> dict:
         row = await db_session.fetchrow(
             """
             SELECT d.is_active, d.mail_server_config_id,
-                   c.server_host, c.smtp_port, c.imap_port, c.sieve_port
+                   c.smtp_host, c.smtp_port, c.imap_host, c.imap_port, c.sieve_host, c.sieve_port
             FROM domains d
             LEFT JOIN mail_server_config c ON c.config_id = d.mail_server_config_id
             WHERE d.domain = $1
@@ -66,13 +76,12 @@ async def get_domain_details(db_session: PgSession, domain: str) -> dict:
             "mail_server_config_id": row["mail_server_config_id"]
         }
         if row["mail_server_config_id"] is not None:
-            # One host serves IMAP, SMTP and Sieve
             details.update({
-                "smtp_server": row["server_host"],
+                "smtp_server": row["smtp_host"],
                 "smtp_port": row["smtp_port"],
-                "imap_server": row["server_host"],
+                "imap_server": row["imap_host"],
                 "imap_port": row["imap_port"],
-                "sieve_server": row["server_host"],
+                "sieve_server": row["sieve_host"],
                 "sieve_port": row["sieve_port"]
             })
         return details
@@ -190,7 +199,8 @@ async def replace_user_settings(db_session: PgSession, user_id: str, settings: d
 
 async def get_or_create_user(db_session: PgSession, user_email: str, user_domain: str, organization_id: Optional[str] = None, organization_name: Optional[str] = None) -> dict:
     """
-    Get the user by email, or create it (random user_id, the default settings) on the first login.
+    Get the user by email, or create it (user_id derived from the email, the default settings) on the first login.
+    Emails are stored in lower case.
     organization_id / organization_name: the user's organization from SSO. Saved on every SSO login, so a user who moved to
     another organization in SSO moves here too, with their contacts and templates (they keep a copy of organization_id).
     Without them (password login): a new user gets the shared organization of their domain (see external_organization_id),
@@ -198,6 +208,7 @@ async def get_or_create_user(db_session: PgSession, user_email: str, user_domain
     Returns user_id, organization_id and organization_name.
     """
     from_sso = organization_id is not None
+    user_email = user_email.strip().lower()
     try:
         if from_sso:
             organization_id = uuid.UUID(str(organization_id))    # Refuses an SSO value that is not a UUID
@@ -217,7 +228,7 @@ async def get_or_create_user(db_session: PgSession, user_email: str, user_domain
                     ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email    -- created at the same moment by another login
                     RETURNING user_id, organization_id, organization_name
                     """,
-                    uuid.uuid4(),
+                    user_id_for_email(user_email),
                     user_email,
                     user_domain,
                     organization_id,
@@ -703,58 +714,85 @@ async def get_template(db_session: PgSession, template_id: int, user_id: str, or
     }
 
 
-def _admin_mail_server(server_host: Optional[str], smtp_server: Optional[str], imap_server: Optional[str], sieve_server: Optional[str]) -> Optional[str]:
+def _admin_mail_server(data: dict) -> dict:
     """
-    The one host of a mail server configuration. Accepts the old form (smtp_server / imap_server / sieve_server)
-    as long as they are the same host. None if no host is given.
+    Mail server of an admin domain request: smtp_host / imap_host / sieve_host and the three ports.
+    The old field names smtp_server / imap_server / sieve_server (sent by the admin screen) work too.
     """
-    hosts = {host.strip().lower() for host in (server_host, smtp_server, imap_server, sieve_server) if host and host.strip()}
-    if len(hosts) > 1:
+    hosts = {
+        service: (data.get(f"{service}_host") or data.get(f"{service}_server") or "").strip().lower()
+        for service in ("smtp", "imap", "sieve")
+    }
+    ports = {service: data.get(f"{service}_port") for service in ("smtp", "imap", "sieve")}
+    if not all(hosts.values()) or None in ports.values():
         raise All_Exceptions(
-            message="IMAP, SMTP and Sieve must use the same server host",
+            message="A domain needs smtp_host, imap_host and sieve_host with smtp_port, imap_port and sieve_port",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
         )
-    return hosts.pop() if hosts else None
+    return {
+        **{f"{service}_host": host for service, host in hosts.items()},
+        **{f"{service}_port": int(port) for service, port in ports.items()},
+        "config_name": (data.get("config_name") or "").strip() or None
+    }
 
 
-def _admin_required_mail_server(server_host, smtp_server, imap_server, sieve_server, smtp_port, imap_port, sieve_port) -> str:
-    """The host of an admin domain request, refused if the host or a port is missing"""
-    host = _admin_mail_server(server_host, smtp_server, imap_server, sieve_server)
-    if not host or None in (smtp_port, imap_port, sieve_port):
-        raise All_Exceptions(
-            message="A domain needs server_host, smtp_port, imap_port and sieve_port",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
+def _default_config_name(server: dict) -> str:
+    """A name for a mail server configuration, from its hosts (config_name is at most 100 characters)"""
+    if server["smtp_host"] == server["imap_host"] == server["sieve_host"]:
+        name = server["imap_host"]
+    elif server["sieve_host"] == server["imap_host"]:
+        name = f"{server['imap_host']} (SMTP {server['smtp_host']})"
+    else:
+        name = f"IMAP {server['imap_host']}, SMTP {server['smtp_host']}, Sieve {server['sieve_host']}"
+    return name[:100]
+
+
+async def _config_for_server(db_session: PgSession, server: dict) -> int:
+    """
+    The mail server configuration with these hosts and ports: an existing one (domains with the same mail server share it),
+    or a new one, named config_name or after its hosts.
+    """
+    values = (server["smtp_host"], server["smtp_port"], server["imap_host"], server["imap_port"], server["sieve_host"], server["sieve_port"])
+    config_id = await db_session.fetchval(
+        """
+        SELECT config_id FROM mail_server_config
+        WHERE smtp_host = $1 AND smtp_port = $2 AND imap_host = $3 AND imap_port = $4 AND sieve_host = $5 AND sieve_port = $6
+        ORDER BY config_id LIMIT 1
+        """,
+        *values
+    )
+    if config_id is not None:
+        return config_id
+
+    return await db_session.fetchval(
+        """
+        INSERT INTO mail_server_config (config_name, smtp_host, smtp_port, imap_host, imap_port, sieve_host, sieve_port)
+        VALUES ($7, $1, $2, $3, $4, $5, $6)
+        RETURNING config_id
+        """,
+        *values,
+        server["config_name"] or _default_config_name(server)
+    )
+
+
+async def _delete_config_if_unused(db_session: PgSession, config_id: Optional[int]) -> None:
+    """Delete a mail server configuration that no domain uses any more"""
+    if config_id is not None:
+        await db_session.execute(
+            "DELETE FROM mail_server_config c WHERE config_id = $1 AND NOT EXISTS (SELECT 1 FROM domains d WHERE d.mail_server_config_id = c.config_id)",
+            config_id
         )
-    return host
 
 
-async def admin_create_new_domain(
-    db_session: PgSession,
-    domain: str,
-    is_active: bool,
-    server_host: Optional[str] = None,
-    smtp_port: Optional[int] = None,
-    imap_port: Optional[int] = None,
-    sieve_port: Optional[int] = None,
-    smtp_server: Optional[str] = None,
-    imap_server: Optional[str] = None,
-    sieve_server: Optional[str] = None
-) -> None:
+async def admin_create_new_domain(db_session: PgSession, domain: str, is_active: bool, data: dict) -> None:
     """
-    Admin function to create a new domain with its mail server configuration (server_host + ports)
+    Admin function to create a new domain with its mail server (an existing configuration with the same servers is shared)
     """
-    host = _admin_required_mail_server(server_host, smtp_server, imap_server, sieve_server, smtp_port, imap_port, sieve_port)
+    server = _admin_mail_server(data)
 
     try:
         async with db_session.transaction():
-            config_id = await db_session.fetchval(
-                """
-                INSERT INTO mail_server_config (server_host, smtp_port, imap_port, sieve_port)
-                VALUES ($1, $2, $3, $4)
-                RETURNING config_id
-                """,
-                host, smtp_port, imap_port, sieve_port
-            )
+            config_id = await _config_for_server(db_session, server)
             await db_session.execute(
                 """
                 INSERT INTO domains (domain, mail_server_config_id, is_active)
@@ -771,50 +809,25 @@ async def admin_create_new_domain(
         )
 
 
-async def admin_edit_domain(
-    db_session: PgSession,
-    domain: str,
-    is_active: bool,
-    server_host: Optional[str] = None,
-    smtp_port: Optional[int] = None,
-    imap_port: Optional[int] = None,
-    sieve_port: Optional[int] = None,
-    smtp_server: Optional[str] = None,
-    imap_server: Optional[str] = None,
-    sieve_server: Optional[str] = None
-) -> None:
+async def admin_edit_domain(db_session: PgSession, domain: str, is_active: bool, data: dict) -> None:
     """
-    Admin function to edit an existing domain: its mail server configuration (created if it had none) and is_active
+    Admin function to edit an existing domain: its mail server and is_active.
+    A configuration can be shared by several domains, so it is never changed in place: the domain is pointed at the
+    configuration of its new servers, and the old one is deleted if no domain uses it any more.
     """
-    host = _admin_required_mail_server(server_host, smtp_server, imap_server, sieve_server, smtp_port, imap_port, sieve_port)
+    server = _admin_mail_server(data)
 
     try:
         async with db_session.transaction():
-            config_id = await db_session.fetchval(
+            old_config_id = await db_session.fetchval(
                 "SELECT mail_server_config_id FROM domains WHERE domain = $1 FOR UPDATE", domain
             )
-
-            if config_id is None:
-                config_id = await db_session.fetchval(
-                    """
-                    INSERT INTO mail_server_config (server_host, smtp_port, imap_port, sieve_port)
-                    VALUES ($1, $2, $3, $4)
-                    RETURNING config_id
-                    """,
-                    host, smtp_port, imap_port, sieve_port
-                )
-            else:
-                await db_session.execute(
-                    """
-                    UPDATE mail_server_config
-                    SET server_host = $2, smtp_port = $3, imap_port = $4, sieve_port = $5, updated_at = NOW()
-                    WHERE config_id = $1
-                    """,
-                    config_id, host, smtp_port, imap_port, sieve_port
-                )
+            config_id = await _config_for_server(db_session, server)
             await db_session.execute(
                 "UPDATE domains SET mail_server_config_id = $2, is_active = $3 WHERE domain = $1", domain, config_id, is_active
             )
+            if old_config_id != config_id:
+                await _delete_config_if_unused(db_session, old_config_id)
 
     except All_Exceptions:
         raise
@@ -829,7 +842,7 @@ async def admin_edit_domain(
 
 async def admin_delete_domain(db_session: PgSession, domain: str) -> None:
     """
-    Admin function to delete a domain from the database (and its mail server configuration).
+    Admin function to delete a domain (and its mail server configuration, if no other domain uses it).
     Its users, their contacts and templates are deleted with it (ON DELETE CASCADE).
     """
     try:
@@ -837,8 +850,7 @@ async def admin_delete_domain(db_session: PgSession, domain: str) -> None:
             config_id = await db_session.fetchval(
                 "DELETE FROM domains WHERE domain = $1 RETURNING mail_server_config_id", domain
             )
-            if config_id is not None:
-                await db_session.execute("DELETE FROM mail_server_config WHERE config_id = $1", config_id)
+            await _delete_config_if_unused(db_session, config_id)
 
     except Exception as e:
         logging.error(f"Error while deleting domain: {e}", exc_info=True)
@@ -849,24 +861,22 @@ async def admin_delete_domain(db_session: PgSession, domain: str) -> None:
 
 
 ADMIN_DOMAIN_COLUMNS = """
-    d.domain, d.is_active, d.created_at, d.mail_server_config_id,
-    c.server_host, c.smtp_port, c.imap_port, c.sieve_port
+    d.domain, d.is_active, d.created_at, d.mail_server_config_id, c.config_name,
+    c.smtp_host, c.smtp_port, c.imap_host, c.imap_port, c.sieve_host, c.sieve_port
 """
 
 
 def _admin_domain_row(row) -> dict:
-    """
-    A domain for the admin API. The old fields smtp_server, imap_server and sieve_server are kept for the admin screen
-    (one host for all three).
-    """
+    """A domain for the admin API (smtp_server / imap_server / sieve_server are the names the admin screen reads)"""
     return {
         "domain": row["domain"],
-        "server_host": row["server_host"],
-        "smtp_server": row["server_host"],
+        "config_id": row["mail_server_config_id"],
+        "config_name": row["config_name"],
+        "smtp_server": row["smtp_host"],
         "smtp_port": row["smtp_port"],
-        "imap_server": row["server_host"],
+        "imap_server": row["imap_host"],
         "imap_port": row["imap_port"],
-        "sieve_server": row["server_host"],
+        "sieve_server": row["sieve_host"],
         "sieve_port": row["sieve_port"],
         "is_active": row["is_active"],
         "created_at": _ts(row["created_at"])
