@@ -4,11 +4,16 @@
 -- Mail Server Configuration
 CREATE TABLE mail_server_config (
     config_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    
-    server_host TEXT NOT NULL,
 
+    config_name VARCHAR(100) NOT NULL,
+
+    smtp_host TEXT NOT NULL,
     smtp_port INTEGER NOT NULL CHECK(smtp_port BETWEEN 1 AND 65535),
+
+    imap_host TEXT NOT NULL,
     imap_port INTEGER NOT NULL CHECK(imap_port BETWEEN 1 AND 65535),
+
+    sieve_host TEXT NOT NULL,
     sieve_port INTEGER NOT NULL CHECK(sieve_port BETWEEN 1 AND 65535),
 
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL,

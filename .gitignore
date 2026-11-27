@@ -27,3 +27,4 @@ temp/
 *.db
 
 temp/
+migrations/
