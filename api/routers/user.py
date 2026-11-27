@@ -291,7 +291,16 @@ async def sso_login_webmail(request: Request, CacheDB: MemcachedDep, PgDB: Postg
         status_code=status.HTTP_200_OK,
         content={
             "message": "SSO Credentials are valid - Login successful",
-            "session_id": session_id
+            "session_id": session_id,
+            # Who signed in, for the UI (never the password)
+            "user_info": {
+                "email": mailbox_info["email"].strip().lower(),
+                "first_name": mailbox_info.get("first_name") or "",
+                "last_name": mailbox_info.get("last_name") or "",
+                "domain_name": mailbox_info["domain_name"],
+                "organization_id": db_user["organization_id"],
+                "organization_name": db_user["organization_name"]
+            }
         }
     )
 
