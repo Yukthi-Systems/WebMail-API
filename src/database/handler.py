@@ -716,24 +716,43 @@ async def get_template(db_session: PgSession, template_id: int, user_id: str, or
 
 def _admin_mail_server(data: dict) -> dict:
     """
-    Mail server of an admin domain request: smtp_host / imap_host / sieve_host and the three ports.
+    Mail server of an admin domain or configuration request: smtp_host / imap_host / sieve_host and the three ports.
     The old field names smtp_server / imap_server / sieve_server (sent by the admin screen) work too.
     """
     hosts = {
-        service: (data.get(f"{service}_host") or data.get(f"{service}_server") or "").strip().lower()
+        service: str(data.get(f"{service}_host") or data.get(f"{service}_server") or "").strip().lower()
         for service in ("smtp", "imap", "sieve")
     }
     ports = {service: data.get(f"{service}_port") for service in ("smtp", "imap", "sieve")}
     if not all(hosts.values()) or None in ports.values():
         raise All_Exceptions(
-            message="A domain needs smtp_host, imap_host and sieve_host with smtp_port, imap_port and sieve_port",
+            message="A mail server needs smtp_host, imap_host and sieve_host with smtp_port, imap_port and sieve_port",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
         )
+    for service, host in hosts.items():
+        if len(host) > 255 or any(character.isspace() for character in host):
+            raise All_Exceptions(message=f"{service}_host is not a valid host name", status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+    checked_ports = {}
+    for service, port in ports.items():
+        try:
+            checked_ports[service] = int(port)
+        except (TypeError, ValueError):
+            checked_ports[service] = 0
+        if isinstance(port, bool) or not 1 <= checked_ports[service] <= 65535:
+            raise All_Exceptions(message=f"{service}_port must be a number from 1 to 65535", status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
     return {
         **{f"{service}_host": host for service, host in hosts.items()},
-        **{f"{service}_port": int(port) for service, port in ports.items()},
-        "config_name": (data.get("config_name") or "").strip() or None
+        **{f"{service}_port": port for service, port in checked_ports.items()},
+        "config_name": _config_name_from(data)
     }
+
+
+def _config_name_from(data: dict) -> Optional[str]:
+    """config_name of a request: trimmed, None if empty, at most 100 characters"""
+    name = str(data.get("config_name") or "").strip()
+    if len(name) > 100:
+        raise All_Exceptions(message="config_name can be at most 100 characters", status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+    return name or None
 
 
 def _default_config_name(server: dict) -> str:
@@ -747,52 +766,102 @@ def _default_config_name(server: dict) -> str:
     return name[:100]
 
 
-async def _config_for_server(db_session: PgSession, server: dict) -> int:
-    """
-    The mail server configuration with these hosts and ports: an existing one (domains with the same mail server share it),
-    or a new one, named config_name or after its hosts.
-    """
-    values = (server["smtp_host"], server["smtp_port"], server["imap_host"], server["imap_port"], server["sieve_host"], server["sieve_port"])
-    config_id = await db_session.fetchval(
+SERVER_COLUMNS = ("smtp_host", "smtp_port", "imap_host", "imap_port", "sieve_host", "sieve_port")
+
+
+async def _config_with_servers(db_session: PgSession, server: dict, except_config_id: Optional[int] = None) -> Optional[int]:
+    """The configuration with exactly these hosts and ports (the oldest if there are several), or None"""
+    return await db_session.fetchval(
         """
         SELECT config_id FROM mail_server_config
         WHERE smtp_host = $1 AND smtp_port = $2 AND imap_host = $3 AND imap_port = $4 AND sieve_host = $5 AND sieve_port = $6
+          AND config_id IS DISTINCT FROM $7
         ORDER BY config_id LIMIT 1
         """,
-        *values
+        *(server[column] for column in SERVER_COLUMNS),
+        except_config_id
     )
-    if config_id is not None:
-        return config_id
 
+
+async def _config_named(db_session: PgSession, name: str, except_config_id: Optional[int] = None) -> Optional[int]:
+    """The configuration with this name (names are compared without case), or None"""
+    return await db_session.fetchval(
+        "SELECT config_id FROM mail_server_config WHERE lower(config_name) = lower($1) AND config_id IS DISTINCT FROM $2 ORDER BY config_id LIMIT 1",
+        name, except_config_id
+    )
+
+
+async def _free_config_name(db_session: PgSession, name: str) -> str:
+    """name, or name (2), name (3) ... if a configuration already has it (for names made from the hosts)"""
+    candidate, number = name, 1
+    while await _config_named(db_session, candidate) is not None:
+        number += 1
+        suffix = f" ({number})"
+        candidate = name[:100 - len(suffix)] + suffix
+    return candidate
+
+
+async def _insert_config(db_session: PgSession, server: dict, name: str) -> int:
     return await db_session.fetchval(
         """
         INSERT INTO mail_server_config (config_name, smtp_host, smtp_port, imap_host, imap_port, sieve_host, sieve_port)
         VALUES ($7, $1, $2, $3, $4, $5, $6)
         RETURNING config_id
         """,
-        *values,
-        server["config_name"] or _default_config_name(server)
+        *(server[column] for column in SERVER_COLUMNS),
+        name
     )
 
 
-async def _delete_config_if_unused(db_session: PgSession, config_id: Optional[int]) -> None:
-    """Delete a mail server configuration that no domain uses any more"""
+async def _config_for_server(db_session: PgSession, server: dict) -> int:
+    """
+    The mail server configuration with these hosts and ports: an existing one (domains with the same mail server share it),
+    or a new one, named config_name or after its hosts.
+    """
+    config_id = await _config_with_servers(db_session, server)
     if config_id is not None:
-        await db_session.execute(
-            "DELETE FROM mail_server_config c WHERE config_id = $1 AND NOT EXISTS (SELECT 1 FROM domains d WHERE d.mail_server_config_id = c.config_id)",
-            config_id
-        )
+        return config_id
+
+    if server["config_name"]:
+        if await _config_named(db_session, server["config_name"]) is not None:
+            raise All_Exceptions(
+                message=f"A configuration named \"{server['config_name']}\" already exists with other servers, choose another name",
+                status_code=status.HTTP_409_CONFLICT
+            )
+        name = server["config_name"]
+    else:
+        name = await _free_config_name(db_session, _default_config_name(server))
+    return await _insert_config(db_session, server, name)
+
+
+async def _domain_config_id(db_session: PgSession, data: dict) -> Optional[int]:
+    """
+    The configuration of an admin domain request:
+      - config_id given: that configuration, or None (no mail server: the domain signs in with SSO only);
+      - otherwise the old way: the configuration of smtp/imap/sieve host and port, found or created.
+    """
+    if "config_id" not in data:
+        return await _config_for_server(db_session, _admin_mail_server(data))
+
+    config_id = data["config_id"]
+    if config_id is None:
+        return None
+    if isinstance(config_id, bool) or not str(config_id).isdigit():
+        raise All_Exceptions(message="config_id must be a configuration id or null", status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+    if not await db_session.fetchval("SELECT 1 FROM mail_server_config WHERE config_id = $1", int(config_id)):
+        raise All_Exceptions(message=f"Configuration {config_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+    return int(config_id)
 
 
 async def admin_create_new_domain(db_session: PgSession, domain: str, is_active: bool, data: dict) -> None:
     """
-    Admin function to create a new domain with its mail server (an existing configuration with the same servers is shared)
+    Admin function to create a new domain.
+    Its mail server: config_id (an existing configuration, or null for SSO only), or the old way, the servers and ports
+    (an existing configuration with the same servers is shared, otherwise one is created).
     """
-    server = _admin_mail_server(data)
-
     try:
         async with db_session.transaction():
-            config_id = await _config_for_server(db_session, server)
+            config_id = await _domain_config_id(db_session, data)
             await db_session.execute(
                 """
                 INSERT INTO domains (domain, mail_server_config_id, is_active)
@@ -800,6 +869,12 @@ async def admin_create_new_domain(db_session: PgSession, domain: str, is_active:
                 """,
                 domain, config_id, is_active
             )
+
+    except All_Exceptions:
+        raise
+
+    except asyncpg.exceptions.UniqueViolationError:
+        raise All_Exceptions(message=f"The domain {domain} already exists", status_code=status.HTTP_409_CONFLICT)
 
     except Exception as e:
         logging.error(f"Error while creating new domain: {e}", exc_info=True)
@@ -812,22 +887,18 @@ async def admin_create_new_domain(db_session: PgSession, domain: str, is_active:
 async def admin_edit_domain(db_session: PgSession, domain: str, is_active: bool, data: dict) -> None:
     """
     Admin function to edit an existing domain: its mail server and is_active.
-    A configuration can be shared by several domains, so it is never changed in place: the domain is pointed at the
-    configuration of its new servers, and the old one is deleted if no domain uses it any more.
+    Mail server: config_id, or the old way, the servers and ports. A configuration can be shared by several domains,
+    so it is never changed here: the domain is pointed at another configuration (edit a configuration to move all its domains).
+    A configuration no domain uses any more is kept, the admin deletes it.
     """
-    server = _admin_mail_server(data)
-
     try:
         async with db_session.transaction():
-            old_config_id = await db_session.fetchval(
-                "SELECT mail_server_config_id FROM domains WHERE domain = $1 FOR UPDATE", domain
-            )
-            config_id = await _config_for_server(db_session, server)
-            await db_session.execute(
+            config_id = await _domain_config_id(db_session, data)
+            updated = await db_session.execute(
                 "UPDATE domains SET mail_server_config_id = $2, is_active = $3 WHERE domain = $1", domain, config_id, is_active
             )
-            if old_config_id != config_id:
-                await _delete_config_if_unused(db_session, old_config_id)
+            if updated == "UPDATE 0":
+                raise All_Exceptions(message=f"Domain {domain} not found", status_code=status.HTTP_404_NOT_FOUND)
 
     except All_Exceptions:
         raise
@@ -842,15 +913,11 @@ async def admin_edit_domain(db_session: PgSession, domain: str, is_active: bool,
 
 async def admin_delete_domain(db_session: PgSession, domain: str) -> None:
     """
-    Admin function to delete a domain (and its mail server configuration, if no other domain uses it).
+    Admin function to delete a domain (its configuration is kept, even if no other domain uses it).
     Its users, their contacts and templates are deleted with it (ON DELETE CASCADE).
     """
     try:
-        async with db_session.transaction():
-            config_id = await db_session.fetchval(
-                "DELETE FROM domains WHERE domain = $1 RETURNING mail_server_config_id", domain
-            )
-            await _delete_config_if_unused(db_session, config_id)
+        await db_session.execute("DELETE FROM domains WHERE domain = $1", domain)
 
     except Exception as e:
         logging.error(f"Error while deleting domain: {e}", exc_info=True)
@@ -858,6 +925,120 @@ async def admin_delete_domain(db_session: PgSession, domain: str) -> None:
             message=f"Failed to delete domain: {e}",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
         )
+
+
+def _admin_config_row(row) -> dict:
+    """A mail server configuration for the admin API, with the number of domains using it"""
+    return {
+        "config_id": row["config_id"],
+        "config_name": row["config_name"],
+        **{column: row[column] for column in SERVER_COLUMNS},
+        "domain_count": row["domain_count"],
+        "created_at": _ts(row["created_at"]),
+        "updated_at": _ts(row["updated_at"])
+    }
+
+
+ADMIN_CONFIG_QUERY = """
+    SELECT c.*, (SELECT count(*) FROM domains d WHERE d.mail_server_config_id = c.config_id) AS domain_count
+    FROM mail_server_config c
+"""
+
+
+async def admin_get_config(db_session: PgSession, config_id: int) -> dict:
+    """Admin function: one mail server configuration (404 if it does not exist)"""
+    row = await db_session.fetchrow(f"{ADMIN_CONFIG_QUERY} WHERE c.config_id = $1", config_id)
+    if not row:
+        raise All_Exceptions(message=f"Configuration {config_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+    return _admin_config_row(row)
+
+
+async def admin_get_all_configs(db_session: PgSession, search_query: str = "") -> list[dict]:
+    """Admin function: all mail server configurations by name, with how many domains use each (search: name or any host)"""
+    rows = await db_session.fetch(
+        f"""
+        {ADMIN_CONFIG_QUERY}
+        WHERE $1 = '' OR c.config_name ILIKE '%' || $1 || '%' OR c.smtp_host ILIKE '%' || $1 || '%'
+           OR c.imap_host ILIKE '%' || $1 || '%' OR c.sieve_host ILIKE '%' || $1 || '%'
+        ORDER BY lower(c.config_name), c.config_id
+        """,
+        search_query.strip()
+    )
+    return [_admin_config_row(row) for row in rows]
+
+
+async def _check_config_is_new(db_session: PgSession, server: dict, name: str, config_id: Optional[int] = None) -> None:
+    """Refuses a name or servers another configuration already has (409)"""
+    if await _config_named(db_session, name, except_config_id=config_id) is not None:
+        raise All_Exceptions(message=f"A configuration named \"{name}\" already exists", status_code=status.HTTP_409_CONFLICT)
+    same_servers = await _config_with_servers(db_session, server, except_config_id=config_id)
+    if same_servers is not None:
+        other_name = await db_session.fetchval("SELECT config_name FROM mail_server_config WHERE config_id = $1", same_servers)
+        raise All_Exceptions(
+            message=f"The configuration \"{other_name}\" already has these servers and ports, use it instead",
+            status_code=status.HTTP_409_CONFLICT
+        )
+
+
+async def admin_create_config(db_session: PgSession, data: dict) -> dict:
+    """Admin function: create a mail server configuration (config_name optional: named after its hosts)"""
+    server = _admin_mail_server(data)
+    async with db_session.transaction():
+        await db_session.execute("LOCK TABLE mail_server_config IN SHARE ROW EXCLUSIVE MODE")
+        name = server["config_name"] or await _free_config_name(db_session, _default_config_name(server))
+        await _check_config_is_new(db_session, server, name)
+        config_id = await _insert_config(db_session, server, name)
+    return await admin_get_config(db_session, config_id)
+
+
+async def admin_edit_config(db_session: PgSession, config_id: int, data: dict) -> dict:
+    """
+    Admin function: rename a configuration and/or change its servers and ports. Every domain using it gets the new servers.
+    Only the fields sent are changed. Users already signed in keep the old servers until they sign in again.
+    """
+    async with db_session.transaction():
+        await db_session.execute("LOCK TABLE mail_server_config IN SHARE ROW EXCLUSIVE MODE")
+        current = await db_session.fetchrow("SELECT * FROM mail_server_config WHERE config_id = $1", config_id)
+        if not current:
+            raise All_Exceptions(message=f"Configuration {config_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+
+        merged = {column: current[column] for column in SERVER_COLUMNS}
+        for service in ("smtp", "imap", "sieve"):
+            for field in (f"{service}_server", f"{service}_host", f"{service}_port"):    # _host wins over the old _server name
+                if data.get(field) is not None:
+                    merged[f"{service}_host" if field.endswith(("_host", "_server")) else field] = data[field]
+        merged["config_name"] = data.get("config_name") if "config_name" in data else current["config_name"]
+        server = _admin_mail_server(merged)
+        name = server["config_name"]
+        if not name:
+            raise All_Exceptions(message="config_name can not be empty", status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+        await _check_config_is_new(db_session, server, name, config_id=config_id)
+        await db_session.execute(
+            """
+            UPDATE mail_server_config
+            SET config_name = $2, smtp_host = $3, smtp_port = $4, imap_host = $5, imap_port = $6, sieve_host = $7, sieve_port = $8,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE config_id = $1
+            """,
+            config_id, name, *(server[column] for column in SERVER_COLUMNS)
+        )
+    return await admin_get_config(db_session, config_id)
+
+
+async def admin_delete_config(db_session: PgSession, config_id: int) -> None:
+    """Admin function: delete a configuration no domain uses (409 with the number of domains otherwise)"""
+    async with db_session.transaction():
+        exists = await db_session.fetchval("SELECT 1 FROM mail_server_config WHERE config_id = $1 FOR UPDATE", config_id)
+        if not exists:
+            raise All_Exceptions(message=f"Configuration {config_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+        used_by = await db_session.fetchval("SELECT count(*) FROM domains WHERE mail_server_config_id = $1", config_id)
+        if used_by:
+            raise All_Exceptions(
+                message=f"The configuration is used by {used_by} domain{'s' if used_by != 1 else ''}, move them to another configuration first",
+                status_code=status.HTTP_409_CONFLICT
+            )
+        await db_session.execute("DELETE FROM mail_server_config WHERE config_id = $1", config_id)
 
 
 ADMIN_DOMAIN_COLUMNS = """

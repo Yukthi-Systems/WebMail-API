@@ -41,7 +41,12 @@ from src.database import (
     admin_edit_domain,
     admin_delete_domain,
     admin_get_all_domains,
-    admin_get_domain_info
+    admin_get_domain_info,
+    admin_get_all_configs,
+    admin_get_config,
+    admin_create_config,
+    admin_edit_config,
+    admin_delete_config
 )
 from src.main import check_smtp_login, check_imap_login, CurrentUser, validate_recaptcha, get_details_from_sso_token
 from src.utils.base.constants import MAX_AGE_OF_CACHE, API_KEY
@@ -510,4 +515,79 @@ async def admin_get_domain_details(request: Request, domain: str, PgDB: Postgres
             "message": "Domain details fetched successfully",
             "data": domain_data
         }
+    )
+
+
+def _check_admin_key(request: Request) -> None:
+    if request.headers.get("X-API-Key") != API_KEY:
+        raise All_Exceptions(message="Unauthorized", status_code=status.HTTP_401_UNAUTHORIZED)
+
+
+# List mail server configurations
+@router.get("/admin/configs", response_class=JSONResponse, tags=["Admin"], summary="List Mail Server Configurations")
+async def admin_list_configs(request: Request, PgDB: PostgresDep, query: str = "") -> JSONResponse:
+    """
+    All mail server configurations, by name, each with domain_count (how many domains use it).
+    query: optional, matches the name or any host.
+    """
+    _check_admin_key(request)
+    configs = await admin_get_all_configs(db_session=PgDB, search_query=query)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"message": "Configurations retrieved successfully", "total_count": len(configs), "data": configs}
+    )
+
+
+# Get one mail server configuration
+@router.get("/admin/config/{config_id}", response_class=JSONResponse, tags=["Admin"], summary="Get Mail Server Configuration")
+async def admin_get_config_details(request: Request, config_id: int, PgDB: PostgresDep) -> JSONResponse:
+    """One mail server configuration with domain_count"""
+    _check_admin_key(request)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"message": "Configuration fetched successfully", "data": await admin_get_config(db_session=PgDB, config_id=config_id)}
+    )
+
+
+# Create mail server configuration
+@router.post("/admin/config", response_class=JSONResponse, tags=["Admin"], summary="Create Mail Server Configuration")
+async def admin_create_config_details(request: Request, data: dict, PgDB: PostgresDep) -> JSONResponse:
+    """
+    Create a mail server configuration.
+    Body: config_name (optional, named after its hosts if empty), smtp_host, smtp_port, imap_host, imap_port, sieve_host, sieve_port.
+    409 if another configuration has the same name (any case) or the same servers and ports.
+    """
+    _check_admin_key(request)
+    config = await admin_create_config(db_session=PgDB, data=data)
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content={"message": "Configuration created successfully", "data": config}
+    )
+
+
+# Edit mail server configuration
+@router.put("/admin/config/{config_id}", response_class=JSONResponse, tags=["Admin"], summary="Edit Mail Server Configuration")
+async def admin_edit_config_details(request: Request, config_id: int, data: dict, PgDB: PostgresDep) -> JSONResponse:
+    """
+    Rename a configuration and/or change its servers and ports: only the fields sent change.
+    Every domain using it gets the new servers at its next sign-in (users already signed in keep the old servers until then).
+    409 if another configuration has the same name (any case) or the same servers and ports.
+    """
+    _check_admin_key(request)
+    config = await admin_edit_config(db_session=PgDB, config_id=config_id, data=data)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"message": "Configuration edited successfully", "data": config}
+    )
+
+
+# Delete mail server configuration
+@router.delete("/admin/config/{config_id}", response_class=JSONResponse, tags=["Admin"], summary="Delete Mail Server Configuration")
+async def admin_delete_config_details(request: Request, config_id: int, PgDB: PostgresDep) -> JSONResponse:
+    """Delete a configuration no domain uses. 409 (with the number of domains) if domains still use it."""
+    _check_admin_key(request)
+    await admin_delete_config(db_session=PgDB, config_id=config_id)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"message": "Configuration deleted successfully"}
     )
